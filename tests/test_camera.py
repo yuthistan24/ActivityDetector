@@ -13,8 +13,9 @@ from activity_detector.vision.camera import CameraManager, CameraState
 class FakeVideoCapture:
     """Mock OpenCV VideoCapture for hardware-independent deterministic testing."""
 
-    def __init__(self, sequence: Optional[List[Optional[np.ndarray]]] = None) -> None:
+    def __init__(self, sequence: Optional[List[Optional[np.ndarray]]] = None, default_frame: Optional[np.ndarray] = None) -> None:
         self.sequence = list(sequence) if sequence is not None else []
+        self.default_frame = default_frame
         self._is_opened = True
         self.read_count = 0
         self.release_count = 0
@@ -32,6 +33,8 @@ class FakeVideoCapture:
             if not self._is_opened:
                 return False, None
             if not self.sequence:
+                if self.default_frame is not None:
+                    return True, self.default_frame.copy()
                 # Default frame: 100x100 solid image
                 f = np.ones((100, 100, 3), dtype=np.uint8) * 128
                 return True, f
@@ -169,3 +172,51 @@ def test_camera_diagnostics_reporting():
     cam.stop()
     diag_stopped = cam.get_diagnostics()
     assert diag_stopped["state"] == "disconnected"
+
+
+def test_frame_id_and_pixel_statistics():
+    """Verify monotonic frame_id increment and pixel statistics in diagnostics."""
+    fake_cap = FakeVideoCapture()
+    config = CameraConfig(source=0, width=640, height=480)
+    cam = CameraManager(config, capture_factory=lambda: fake_cap)
+
+    cam.start()
+    time.sleep(0.08)
+
+    is_conn, frame, fps, frame_id_1, ts1 = cam.get_frame_packet()
+    assert is_conn is True
+    assert frame_id_1 > 0
+    assert ts1 > 0
+
+    time.sleep(0.04)
+    is_conn, frame, fps, frame_id_2, ts2 = cam.get_frame_packet()
+    assert frame_id_2 >= frame_id_1
+    assert ts2 >= ts1
+
+    diag = cam.get_diagnostics()
+    assert "frame_id" in diag
+    assert "pixel_mean" in diag
+    assert "pixel_std" in diag
+    assert "is_black_frame" in diag
+    # FakeVideoCapture produces 128 grey frames -> mean should be ~128.0, is_black_frame False
+    assert diag["pixel_mean"] == pytest.approx(128.0, abs=1.0)
+    assert diag["is_black_frame"] is False
+
+    cam.stop()
+
+
+def test_black_frame_flag_on_zero_pixels():
+    """Verify black frame detection triggers when sensor returns all zeros."""
+    black_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    fake_cap = FakeVideoCapture(default_frame=black_frame)
+    config = CameraConfig(source=0, width=640, height=480)
+    cam = CameraManager(config, capture_factory=lambda: fake_cap)
+
+    cam.start()
+    time.sleep(0.08)
+
+    diag = cam.get_diagnostics()
+    assert diag["pixel_mean"] == pytest.approx(0.0, abs=0.1)
+    assert diag["is_black_frame"] is True
+
+    cam.stop()

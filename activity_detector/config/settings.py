@@ -75,10 +75,14 @@ class VlmConfig(BaseModel):
     model: str = Field(default="qwen3.5:latest")
     alternative_model: str = Field(default="gemma4:e4b-it-qat")
     host: str = Field(default="http://localhost:11434")
-    sample_interval_seconds: float = Field(default=4.0, ge=1.0, le=60.0)
+    sample_interval_seconds: float = Field(default=4.0, ge=0.1, le=60.0)
     num_ctx: int = Field(default=2048, ge=512, le=32768)
     num_gpu: int = Field(default=0, ge=0, le=64, description="0 offloads compute buffers to CPU to prevent CUDA OOM on laptop GPUs")
-    timeout_seconds: float = Field(default=12.0, ge=2.0, le=60.0)
+    timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
+    image_max_dimension: int = Field(default=480, ge=240, le=1280)
+    jpeg_quality: int = Field(default=75, ge=40, le=95)
+    failure_cooldown_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    max_consecutive_failures: int = Field(default=3, ge=1, le=10)
 
 
 class AudioConfig(BaseModel):

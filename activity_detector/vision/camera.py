@@ -61,9 +61,12 @@ class CameraManager:
         # Buffer & Performance metrics
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_count: int = 0
+        self._frame_id: int = 0
         self._fps: float = 0.0
         self._last_fps_calc_time: float = 0.0
         self._frames_since_calc: int = 0
+        self._pixel_stats: Dict[str, float] = {"mean": 0.0, "std": 0.0, "min": 0, "max": 0}
+        self._is_black_frame: bool = False
 
         # Health & Diagnostic telemetry
         self.state: CameraState = CameraState.DISCONNECTED
@@ -284,15 +287,33 @@ class CameraManager:
 
             # 3. Handle read success
             if ret and frame is not None:
+                prev_failures = self.consecutive_read_failures
                 self.consecutive_read_failures = 0
                 self.state = CameraState.CONNECTED
                 self.last_successful_read_time = now
+
+                if prev_failures > 0:
+                    logger.info(
+                        f"Camera stream restored on source {self.source} ({self.backend_name}) "
+                        f"after {prev_failures} transient drop(s)."
+                    )
+
+                # Quick pixel statistics on subsampled pixels (fast, negligible overhead)
+                p_sample = frame[::8, ::8]
+                p_mean = round(float(np.mean(p_sample)), 2)
+                p_std = round(float(np.std(p_sample)), 2)
+                p_min = int(np.min(p_sample))
+                p_max = int(np.max(p_sample))
+                is_black = bool(p_mean < 5.0 and p_std < 2.0)
 
                 # Bounded buffer: store newest frame under lock
                 with self._lock:
                     self._latest_frame = frame
                     self._frame_count += 1
+                    self._frame_id += 1
                     self._frames_since_calc += 1
+                    self._pixel_stats = {"mean": p_mean, "std": p_std, "min": p_min, "max": p_max}
+                    self._is_black_frame = is_black
 
                 # Update running FPS calculation
                 dt = now - self._last_fps_calc_time
@@ -399,25 +420,44 @@ class CameraManager:
         Returns:
             (has_frame, frame_copy, current_fps)
         """
+        is_conn, frame, fps, _, _ = self.get_frame_packet()
+        return is_conn, frame, fps
+
+    def get_frame_packet(self) -> Tuple[bool, Optional[np.ndarray], float, int, float]:
+        """Thread-safe retrieval of frame with monotonic frame_id and timestamp.
+
+        Returns:
+            (is_connected, frame_copy, current_fps, frame_id, timestamp)
+        """
         with self._lock:
             if self._latest_frame is None:
                 fallback = self._create_diagnostic_frame("INITIALIZING CAMERA FEED", f"Source: {self.source}")
-                return False, fallback, 0.0
-            return self.is_connected, self._latest_frame.copy(), self._fps
+                return False, fallback, 0.0, 0, time.time()
+            return self.is_connected, self._latest_frame.copy(), self._fps, self._frame_id, self.last_successful_read_time
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Returns comprehensive diagnostic telemetry for UI and audit logs."""
+        with self._lock:
+            stats = dict(self._pixel_stats)
+            is_black = self._is_black_frame
+            fid = self._frame_id
         return {
             "state": self.state.value,
             "backend": self.backend_name,
             "source": self.source,
             "fps": self._fps,
+            "frame_id": fid,
             "frame_count": self._frame_count,
             "consecutive_failures": self.consecutive_read_failures,
             "reconnect_attempts": self.reconnect_attempts,
             "last_frame_age_seconds": self.last_frame_age,
             "is_stale": self.is_stale,
             "last_error": self.last_error,
+            "pixel_mean": stats.get("mean", 0.0),
+            "pixel_std": stats.get("std", 0.0),
+            "pixel_min": stats.get("min", 0),
+            "pixel_max": stats.get("max", 0),
+            "is_black_frame": is_black,
         }
 
     def _create_diagnostic_frame(self, title: str, subtitle: str) -> np.ndarray:

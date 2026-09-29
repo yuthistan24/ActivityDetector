@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -53,6 +54,10 @@ class VisionPipeline:
 
         self._frame_count: int = 0
         self._last_vlm_interpretation: Optional[VlmInterpretation] = None
+        self._fresh_frame_times: collections.deque = collections.deque()
+        self._last_seen_frame_id: int = -1
+        self._ui_fresh_fps: float = 0.0
+        self._last_fresh_ui_time: float = time.time()
 
     def set_target_object(self, object_name: str) -> None:
         """Dynamically updates the target object being monitored."""
@@ -71,12 +76,32 @@ class VisionPipeline:
 
     def process_next_frame(self, current_engine_update: Optional[EngineUpdate] = None) -> Tuple[np.ndarray, FrameEvidence]:
         """Pulls latest frame, runs local detectors, samples VLM, and draws HUD annotations."""
-        has_frame, raw_frame, fps = self.camera.get_frame()
+        has_frame, raw_frame, cam_fps, frame_id, frame_time = self.camera.get_frame_packet()
         self._frame_count += 1
         now = time.time()
 
         if raw_frame is None:
             raw_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        # Track UI fresh frame arrival rate
+        if frame_id > 0 and frame_id != self._last_seen_frame_id:
+            self._last_seen_frame_id = frame_id
+            self._last_fresh_ui_time = now
+            self._fresh_frame_times.append(now)
+
+        while self._fresh_frame_times and (now - self._fresh_frame_times[0]) > 1.0:
+            self._fresh_frame_times.popleft()
+
+        if len(self._fresh_frame_times) >= 2:
+            dt = self._fresh_frame_times[-1] - self._fresh_frame_times[0]
+            if dt > 0.05:
+                self._ui_fresh_fps = round((len(self._fresh_frame_times) - 1) / dt, 1)
+            else:
+                self._ui_fresh_fps = float(len(self._fresh_frame_times))
+        elif len(self._fresh_frame_times) == 1:
+            self._ui_fresh_fps = 1.0
+        else:
+            self._ui_fresh_fps = 0.0
 
         # 1. Deterministic Rule-based Detection (supporting cues)
         deterministic_detections = self.detector.detect(raw_frame)
@@ -85,14 +110,24 @@ class VisionPipeline:
         yolo_detections = self.yolo.detect(raw_frame) if self.yolo.available else []
         all_detections = deterministic_detections + yolo_detections
 
-        # 3. Sample VLM for Generic Object State
+        # 3. Sample VLM for Generic Object State (ONLY during active session, never while IDLE)
         vlm_summary = None
         vlm_conf = None
         vlm_uncertain = False
         vlm_state: Dict[str, Any] = {}
         vlm_sample_id: Optional[str] = None
 
-        if self.vlm and current_engine_update and current_engine_update.current_step:
+        is_session_active = (
+            current_engine_update is not None
+            and current_engine_update.state in (
+                EngineState.IN_PROGRESS,
+                EngineState.NEEDS_ATTENTION,
+                EngineState.UNCERTAIN,
+            )
+            and current_engine_update.current_step is not None
+        )
+
+        if self.vlm and is_session_active and not getattr(self.vlm, "is_paused", False):
             step = current_engine_update.current_step
             # Submit sample for background inference
             self.vlm.submit_sample(
@@ -113,6 +148,12 @@ class VisionPipeline:
                 vlm_state = interp.schema_data.model_dump()
                 vlm_sample_id = str(interp.timestamp)
 
+        # Flag evidence as uncertain if VLM has entered degraded status
+        if self.vlm and getattr(self.vlm, "is_degraded", False):
+            vlm_uncertain = True
+            deg_reason = getattr(self.vlm, 'degraded_reason', 'OOM / Timeout')
+            vlm_summary = f"[DEGRADED: {deg_reason}] {vlm_summary}" if vlm_summary else f"VLM degraded: {deg_reason}"
+
         # 4. Construct FrameEvidence
         evidence = FrameEvidence(
             frame_number=self._frame_count,
@@ -127,7 +168,7 @@ class VisionPipeline:
         )
 
         # 5. Draw HUD Overlays onto frame copy
-        annotated_frame = self._draw_hud(raw_frame, evidence, current_engine_update, fps)
+        annotated_frame = self._draw_hud(raw_frame, evidence, current_engine_update, self._ui_fresh_fps)
         return annotated_frame, evidence
 
     def _draw_hud(
@@ -178,7 +219,13 @@ class VisionPipeline:
 
     def get_camera_diagnostics(self) -> Dict[str, Any]:
         """Exposes live camera telemetry for UI and logging."""
-        return self.camera.get_diagnostics()
+        diag = self.camera.get_diagnostics()
+        diag["ui_fresh_fps"] = self._ui_fresh_fps
+        return diag
+
+    def get_ui_fresh_fps(self) -> float:
+        """Returns the actual fresh-frame arrival rate reaching the UI."""
+        return self._ui_fresh_fps
 
     def _render_top_banner(
         self,
@@ -206,8 +253,8 @@ class VisionPipeline:
         cv2.putText(canvas, state_str, (chip_x + 8, chip_y + 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
         # Step and Target Object Information
-        step_text = f"Target: [{self.target_object}] | Idle"
-        if update and update.current_step:
+        step_text = f"Target: [{self.target_object}] | PREVIEW (Position object & press Start Session)"
+        if update and update.state != EngineState.IDLE and update.current_step:
             step_text = f"Target: [{self.target_object}] | Step {update.current_step.order}: {update.current_step.name}"
         elif update and state == EngineState.COMPLETED:
             step_text = f"Target: [{self.target_object}] | Procedure Completed"
@@ -234,24 +281,38 @@ class VisionPipeline:
         cam_diag = self.camera.get_diagnostics()
         cam_state = cam_diag["state"].upper()
         cam_age = cam_diag["last_frame_age_seconds"]
+        is_black = cam_diag.get("is_black_frame", False)
 
         if cam_diag["is_stale"] or cam_diag["state"] == "reconnecting":
             cam_color = (40, 160, 240) if cam_diag["state"] == "reconnecting" else (50, 50, 230)
             cam_text = f"CAM: {cam_state} ({cam_age:.1f}s)"
+        elif is_black:
+            cam_color = (50, 50, 230)
+            cam_text = f"CAM: BLACK FRAME [Shutter]"
         elif cam_diag["state"] == "connected":
             cam_color = (70, 210, 100)
-            cam_text = f"CAM: {fps:4.1f} FPS [{cam_diag['backend'][:10]}]"
+            cam_text = f"CAM: {self._ui_fresh_fps:4.1f} FPS [{cam_diag['backend'][:10]}]"
         else:
             cam_color = (50, 50, 230)
             cam_text = f"CAM: {cam_state}"
 
-        cv2.putText(canvas, cam_text, (w - 260, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, cam_color, 1, cv2.LINE_AA)
+        cv2.putText(canvas, cam_text, (w - 280, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, cam_color, 1, cv2.LINE_AA)
 
         # VLM State Pill
         vlm_badge = "VLM: OFF"
         vlm_color = (120, 120, 120)
         if self.vlm:
-            if self._last_vlm_interpretation:
+            if getattr(self.vlm, "is_paused", False):
+                vlm_badge = "VLM: PAUSED (Diag)"
+                vlm_color = (140, 140, 140)
+            elif getattr(self.vlm, "is_degraded", False):
+                reason = getattr(self.vlm, "degraded_reason", "Unavailable")
+                vlm_badge = f"VLM: DEGRADED ({reason[:16]})"
+                vlm_color = (40, 160, 240)
+            elif state == EngineState.IDLE:
+                vlm_badge = "VLM: STANDBY (Session Start)"
+                vlm_color = (160, 180, 200)
+            elif self._last_vlm_interpretation:
                 conf = int(self._last_vlm_interpretation.schema_data.confidence * 100)
                 st = self._last_vlm_interpretation.schema_data
                 oc = st.open_or_closed if st.open_or_closed != "unknown" else ""
@@ -262,14 +323,26 @@ class VisionPipeline:
             else:
                 vlm_badge = "VLM: Sampling image..."
                 vlm_color = (240, 180, 50)
-        cv2.putText(canvas, vlm_badge, (w - 260, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, vlm_color, 1, cv2.LINE_AA)
+        cv2.putText(canvas, vlm_badge, (w - 280, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, vlm_color, 1, cv2.LINE_AA)
 
-        # If camera is stale / frozen, render warning banner across the frame
-        if cam_diag["is_stale"] and cam_diag["state"] == "connected":
+        # If camera frame is pitch black, draw warning banner across frame
+        if is_black and cam_diag["state"] == "connected":
+            cv2.rectangle(canvas, (0, 56), (w, 82), (20, 20, 180), -1)
+            cv2.putText(
+                canvas,
+                f"WARNING: SENSOR FRAME IS BLACK (Mean: {cam_diag.get('pixel_mean', 0.0):.1f}) - Check physical lens privacy shutter / room light",
+                (20, 74),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        elif cam_diag["is_stale"] and cam_diag["state"] == "connected":
             cv2.rectangle(canvas, (0, 56), (w, 78), (20, 20, 180), -1)
             cv2.putText(
                 canvas,
-                f"WARNING: CAMERA FEED STALE / FROZEN (Last frame received {cam_age:.1f}s ago)",
+                f"WARNING: CAMERA FEED STALE / FROZEN (Last fresh frame received {cam_age:.1f}s ago)",
                 (20, 72),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,

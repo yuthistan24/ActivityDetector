@@ -93,3 +93,220 @@ def test_mock_vlm_client():
     assert latest.schema_data.open_or_closed == "open"
     assert latest.schema_data.confidence == 0.92
     assert latest.target_object == "notebook"
+
+
+def test_vlm_pause_and_resume():
+    client = OllamaVlmClient(VlmConfig(enabled=True))
+    assert client.is_paused is False
+
+    client.pause()
+    assert client.is_paused is True
+
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    # When paused, submit_sample must immediately return False
+    submitted = client.submit_sample(
+        frame=frame,
+        target_object="notebook",
+        step_name="Step 1",
+        step_instruction="Test",
+    )
+    assert submitted is False
+
+    client.resume()
+    assert client.is_paused is False
+    client.stop()
+
+
+def test_pipeline_does_not_sample_vlm_when_idle():
+    """Verify that when engine is in IDLE state, the vision pipeline does NOT submit frames to VLM."""
+    from activity_detector.config.settings import get_default_config
+    from activity_detector.core.engine import EngineState, EngineUpdate
+    from activity_detector.core.procedure import StepDefinition, ExpectedEvidence
+    from activity_detector.vision.pipeline import VisionPipeline
+
+    mock = MockVlmClient()
+    config = get_default_config()
+    pipeline = VisionPipeline(config, vlm_client=mock)
+
+    # Frame tick with IDLE state
+    idle_update = EngineUpdate(
+        state=EngineState.IDLE,
+        current_step_index=0,
+        current_step=StepDefinition(
+            id="step_1",
+            order=1,
+            name="Locate Notebook",
+            instruction="Find notebook",
+            expected_evidence=ExpectedEvidence(target_object="notebook", expected_state={}),
+        ),
+        next_step=None,
+        progress_percentage=0.0,
+        step_records=[],
+        recent_warning=None,
+        stability_ratio=0.0,
+        evidence_summary="",
+        evidence_source="none",
+        transition_occurred=False,
+    )
+
+    annotated, evidence = pipeline.process_next_frame(idle_update)
+    # VLM must NOT have received any samples because engine is IDLE
+    assert mock.submit_count == 0
+    assert evidence.vlm_sample_id is None
+
+    pipeline.stop()
+
+
+
+def test_vlm_cooldown_and_degraded_state(monkeypatch):
+    """Verify that failed inference calls trigger backoff cooldown and degrade after threshold."""
+    import time
+    from unittest.mock import MagicMock
+    from activity_detector.config.settings import VlmConfig
+    from activity_detector.vision.vlm import OllamaVlmClient
+
+    config = VlmConfig(
+        enabled=True,
+        sample_interval_seconds=0.1,
+        failure_cooldown_seconds=0.1,
+        max_consecutive_failures=3,
+    )
+    client = OllamaVlmClient(config)
+
+    # Monkeypatch the internal _query_ollama chat call by raising inside client
+    mock_ollama_module = MagicMock()
+    mock_instance = MagicMock()
+    mock_instance.chat.side_effect = TimeoutError("timed out")
+    mock_ollama_module.Client.return_value = mock_instance
+    monkeypatch.setattr("activity_detector.vision.vlm.ollama", mock_ollama_module, raising=False)
+    # Also patch sys.modules in case import ollama is called inside the function
+    import sys
+    monkeypatch.setitem(sys.modules, "ollama", mock_ollama_module)
+
+    # Test failure #1
+    interp1 = client._query_ollama(
+        b64_img="abc", width=100, height=100, bytes_len=100,
+        target_object="notebook", step_name="Step 1", step_instruction="Test",
+        expected_state={}
+    )
+    assert interp1.is_valid is False
+    assert interp1.schema_data.is_uncertain is True
+    assert client.consecutive_failures == 1
+    assert client.is_degraded is False
+    assert client._cooldown_until > time.time()
+
+    # While cooldown is active, submit_sample must drop frame
+    frame = np.ones((100, 100, 3), dtype=np.uint8) * 128
+    assert client.submit_sample(frame, "notebook", "Step 1", "Test") is False
+
+    # Test failure #2 and #3
+    client._query_ollama(
+        b64_img="abc", width=100, height=100, bytes_len=100,
+        target_object="notebook", step_name="Step 1", step_instruction="Test",
+        expected_state={}
+    )
+    assert client.consecutive_failures == 2
+    assert client.is_degraded is False
+
+    client._query_ollama(
+        b64_img="abc", width=100, height=100, bytes_len=100,
+        target_object="notebook", step_name="Step 1", step_instruction="Test",
+        expected_state={}
+    )
+    assert client.consecutive_failures == 3
+    assert client.is_degraded is True
+    assert "Timeout" in client.degraded_reason
+
+    # Now simulate a recovery on query #4
+    mock_instance.chat.side_effect = None
+    mock_instance.chat.return_value = {
+        "message": {
+            "content": '{"object_visible": true, "object_description": "notebook", "open_or_closed": "open", "held_or_on_surface": "on_surface", "location": "workspace_center", "confidence": 0.9, "is_uncertain": false, "reasoning": "visible"}'
+        }
+    }
+    interp_rec = client._query_ollama(
+        b64_img="abc", width=100, height=100, bytes_len=100,
+        target_object="notebook", step_name="Step 1", step_instruction="Test",
+        expected_state={}
+    )
+    assert interp_rec.is_valid is True
+    assert client.consecutive_failures == 0
+    assert client.is_degraded is False
+
+    client.stop()
+
+
+def test_vlm_frame_resizing_and_compression():
+    """Verify that oversized frames are scaled to max_dimension and JPEG compressed."""
+    from activity_detector.config.settings import VlmConfig
+    from activity_detector.vision.vlm import OllamaVlmClient
+
+    config = VlmConfig(
+        enabled=True,
+        image_max_dimension=480,
+        jpeg_quality=75,
+        sample_interval_seconds=0.1,
+    )
+    client = OllamaVlmClient(config)
+
+    # Frame 1280x720
+    large_frame = np.ones((720, 1280, 3), dtype=np.uint8) * 128
+    submitted = client.submit_sample(
+        frame=large_frame,
+        target_object="notebook",
+        step_name="Step 1",
+        step_instruction="Test instruction",
+    )
+    assert submitted is True
+
+    # Check queued payload
+    queued = client._queue.get_nowait()
+    assert queued["width"] == 480
+    assert queued["height"] == 270  # 720 * (480 / 1280) = 270
+    assert queued["bytes_len"] < 100000  # JPEG compressed
+
+    client.stop()
+
+
+def test_pipeline_marks_uncertain_when_vlm_degraded():
+    """Verify that when VLM is in degraded state, FrameEvidence flags vlm_uncertain = True."""
+    from activity_detector.config.settings import get_default_config
+    from activity_detector.core.engine import EngineState, EngineUpdate
+    from activity_detector.core.procedure import StepDefinition, ExpectedEvidence
+    from activity_detector.vision.pipeline import VisionPipeline
+
+    mock = MockVlmClient()
+    # Force mock into degraded state
+    mock._is_degraded = True
+    mock._degraded_reason = "OOM: Out of memory"
+
+    config = get_default_config()
+    pipeline = VisionPipeline(config, vlm_client=mock)
+
+    active_update = EngineUpdate(
+        state=EngineState.IN_PROGRESS,
+        current_step_index=0,
+        current_step=StepDefinition(
+            id="step_1",
+            order=1,
+            name="Locate Notebook",
+            instruction="Find notebook",
+            expected_evidence=ExpectedEvidence(target_object="notebook", expected_state={}),
+        ),
+        next_step=None,
+        progress_percentage=0.0,
+        step_records=[],
+        recent_warning=None,
+        stability_ratio=0.0,
+        evidence_summary="",
+        evidence_source="none",
+        transition_occurred=False,
+    )
+
+    _, evidence = pipeline.process_next_frame(active_update)
+    assert evidence.vlm_uncertain is True
+    assert "degraded" in evidence.vlm_summary.lower()
+
+    pipeline.stop()
+
+

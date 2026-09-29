@@ -71,7 +71,7 @@ def run_preflight_checks(config: AppConfig) -> PreflightReport:
             failed_reads = 0
             last_w, last_h = 0, 0
             t_start = time.time()
-            max_duration = 1.0
+            max_duration = 1.5
             target_frames = 25
 
             while (time.time() - t_start) < max_duration and frames_captured < target_frames:

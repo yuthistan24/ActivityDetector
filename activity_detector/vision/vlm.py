@@ -121,6 +121,29 @@ class BaseVlmClient(ABC):
         """Shuts down background worker threads cleanly."""
         pass
 
+    @property
+    def is_paused(self) -> bool:
+        """True if background sampling is paused."""
+        return False
+
+    def pause(self) -> None:
+        """Pauses background sampling."""
+        pass
+
+    def resume(self) -> None:
+        """Resumes background sampling."""
+        pass
+
+    @property
+    def is_degraded(self) -> bool:
+        """True if the VLM client has encountered persistent failures and is degraded."""
+        return False
+
+    @property
+    def degraded_reason(self) -> str:
+        """Human-readable reason for degradation if degraded."""
+        return ""
+
 
 class OllamaVlmClient(BaseVlmClient):
     """Threaded Ollama vision client with rate limiting and strict schema validation."""
@@ -129,10 +152,17 @@ class OllamaVlmClient(BaseVlmClient):
         self.config = config
         self._queue: Queue = Queue(maxsize=1)  # Drop old samples so we never lag behind
         self._running: bool = True
+        self._paused: bool = False
         self._lock = threading.Lock()
         self._latest_interpretation: Optional[VlmInterpretation] = None
         self._last_sample_time: float = 0.0
         self._active_model: str = config.model
+
+        # Cooldown & degradation tracking
+        self._consecutive_failures: int = 0
+        self._cooldown_until: float = 0.0
+        self._is_degraded: bool = False
+        self._degraded_reason: str = ""
 
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -140,6 +170,34 @@ class OllamaVlmClient(BaseVlmClient):
             daemon=True
         )
         self._thread.start()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._is_degraded
+
+    @property
+    def degraded_reason(self) -> str:
+        return self._degraded_reason
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    def pause(self) -> None:
+        self._paused = True
+        try:
+            self._queue.get_nowait()
+        except Empty:
+            pass
+        logger.info("VLM background sampling PAUSED.")
+
+    def resume(self) -> None:
+        self._paused = False
+        logger.info("VLM background sampling RESUMED.")
 
     def submit_sample(
         self,
@@ -150,20 +208,34 @@ class OllamaVlmClient(BaseVlmClient):
         expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Pushes a sampled frame to the background queue if interval has elapsed."""
-        if not self.config.enabled or frame is None:
+        if not self.config.enabled or self._paused or frame is None:
             return False
 
         now = time.time()
+        # Suppress queueing during failure cooldown
+        if now < self._cooldown_until:
+            return False
+
         if (now - self._last_sample_time) < self.config.sample_interval_seconds:
             return False
 
         self._last_sample_time = now
 
-        # Compress to 640px wide JPEG to accelerate local base64 transfer & inference
+        # Compress to configurable dimensions (default max 480px) and quality (default 75)
         h, w = frame.shape[:2]
-        target_w = 640
-        target_h = int(h * (target_w / float(w)))
-        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        max_dim = getattr(self.config, "image_max_dimension", 480)
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            target_w = int(w * scale)
+            target_h = int(h * scale)
+            resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        else:
+            target_w, target_h = w, h
+            resized = frame
+
+        quality = getattr(self.config, "jpeg_quality", 75)
+        _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        b64_img = base64.b64encode(buf).decode("utf-8")
 
         # Clear any stale queued item
         try:
@@ -173,7 +245,10 @@ class OllamaVlmClient(BaseVlmClient):
 
         try:
             self._queue.put_nowait({
-                "frame": resized,
+                "b64_img": b64_img,
+                "width": target_w,
+                "height": target_h,
+                "bytes_len": len(buf),
                 "target_object": target_object,
                 "step_name": step_name,
                 "step_instruction": step_instruction,
@@ -210,15 +285,23 @@ class OllamaVlmClient(BaseVlmClient):
             if item is None or not self._running:
                 break
 
-            # Discard outdated pending frames if queued longer than 4.0s
-            queue_age = time.time() - item.get("timestamp", time.time())
-            if queue_age > 4.0:
+            # If currently in failure cooldown, wait before sending any new request
+            now = time.time()
+            if now < self._cooldown_until:
+                continue
+
+            # Discard outdated pending frames if queued longer than 3.0s
+            queue_age = now - item.get("timestamp", now)
+            if queue_age > 3.0:
                 logger.info(f"Discarding outdated pending VLM sample ({queue_age:.2f}s old).")
                 continue
 
             t0 = time.time()
             interp = self._query_ollama(
-                frame=item["frame"],
+                b64_img=item["b64_img"],
+                width=item["width"],
+                height=item["height"],
+                bytes_len=item["bytes_len"],
                 target_object=item["target_object"],
                 step_name=item["step_name"],
                 step_instruction=item["step_instruction"],
@@ -231,19 +314,19 @@ class OllamaVlmClient(BaseVlmClient):
 
     def _query_ollama(
         self,
-        frame: np.ndarray,
+        b64_img: str,
+        width: int,
+        height: int,
+        bytes_len: int,
         target_object: str,
         step_name: str,
         step_instruction: str,
         expected_state: Dict[str, Any],
     ) -> VlmInterpretation:
-        """Sends single frame and strict JSON prompt to Ollama with timeout and logging."""
+        """Sends pre-encoded frame and strict JSON prompt to Ollama with timeout and logging."""
         t_start = time.time()
         try:
             import ollama  # type: ignore
-
-            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            b64_img = base64.b64encode(buf).decode("utf-8")
 
             prompt = (
                 f"You are an offline lab vision assistant inspecting tabletop procedure execution.\n"
@@ -267,15 +350,16 @@ class OllamaVlmClient(BaseVlmClient):
             )
 
             # Set explicit timeout so unresponsive daemon cannot hang worker
-            client = ollama.Client(host=self.config.host, timeout=20.0)
+            client = ollama.Client(host=self.config.host, timeout=self.config.timeout_seconds)
             options = {
                 "num_ctx": self.config.num_ctx,
                 "num_gpu": self.config.num_gpu,
+                "num_predict": 60,
             }
 
             logger.info(
                 f"Submitting frame to Ollama ({self._active_model}) for '{target_object}' "
-                f"(step: '{step_name}')..."
+                f"(step: '{step_name}') | size: {width}x{height} ({bytes_len} bytes JPEG)..."
             )
             resp = client.chat(
                 model=self._active_model,
@@ -295,6 +379,12 @@ class OllamaVlmClient(BaseVlmClient):
                 f"(valid={is_valid}, conf={schema_data.confidence:.2f})."
             )
 
+            # Success resets failure counter and cooldown
+            self._consecutive_failures = 0
+            self._cooldown_until = 0.0
+            self._is_degraded = False
+            self._degraded_reason = ""
+
             return VlmInterpretation(
                 timestamp=time.time(),
                 schema_data=schema_data,
@@ -307,8 +397,26 @@ class OllamaVlmClient(BaseVlmClient):
 
         except Exception as e:
             duration = round(time.time() - t_start, 2)
+            self._consecutive_failures += 1
+            base_cd = getattr(self.config, "failure_cooldown_seconds", 5.0)
+            backoff = min(60.0, base_cd * (1.5 ** min(self._consecutive_failures - 1, 5)))
+            self._cooldown_until = time.time() + backoff
+
+            err_msg = str(e)
+            if "out-of-memory" in err_msg.lower() or "failed to allocate" in err_msg.lower():
+                short_err = "OOM: Insufficient CPU RAM for model"
+            elif "timed out" in err_msg.lower():
+                short_err = f"Timeout after {duration}s"
+            else:
+                short_err = f"{type(e).__name__}: {err_msg[:45]}"
+
+            if self._consecutive_failures >= getattr(self.config, "max_consecutive_failures", 3):
+                self._is_degraded = True
+                self._degraded_reason = short_err
+
             logger.warning(
-                f"Ollama inference exception after {duration}s with {self._active_model}: {e}"
+                f"Ollama inference exception #{self._consecutive_failures} after {duration}s with {self._active_model}: {e}. "
+                f"Backing off for {backoff:.1f}s."
             )
             fallback_schema = VlmResponseSchema(
                 object_visible=False,
@@ -318,7 +426,7 @@ class OllamaVlmClient(BaseVlmClient):
                 location="unknown",
                 confidence=0.0,
                 is_uncertain=True,
-                reasoning=str(e),
+                reasoning=short_err,
             )
             return VlmInterpretation(
                 timestamp=time.time(),
@@ -436,6 +544,28 @@ class MockVlmClient(BaseVlmClient):
         self.mock_uncertain = mock_uncertain
         self.mock_step_recognized = mock_step_recognized
         self._latest: Optional[VlmInterpretation] = None
+        self._paused: bool = False
+        self.submit_count: int = 0
+        self._is_degraded: bool = False
+        self._degraded_reason: str = ""
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._is_degraded
+
+    @property
+    def degraded_reason(self) -> str:
+        return self._degraded_reason
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
 
     def submit_sample(
         self,
@@ -445,6 +575,9 @@ class MockVlmClient(BaseVlmClient):
         step_instruction: str,
         expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        if self._paused:
+            return False
+        self.submit_count += 1
         schema = VlmResponseSchema(
             object_visible=self.mock_object_visible,
             object_description=f"Mock description of {target_object}",

@@ -326,6 +326,11 @@ class MainWindow(QMainWindow):
         self.btn_record.clicked.connect(self._toggle_recording)
         layout.addWidget(self.btn_record)
 
+        self.btn_toggle_vlm = QPushButton("Pause VLM")
+        self.btn_toggle_vlm.setStyleSheet("background-color: #1e293b; color: white;")
+        self.btn_toggle_vlm.clicked.connect(self._toggle_vlm_sampling)
+        layout.addWidget(self.btn_toggle_vlm)
+
         self.btn_mute = QPushButton("Mute Audio" if not self.speech.is_muted else "Unmute Audio")
         self.btn_mute.clicked.connect(self._toggle_mute)
         layout.addWidget(self.btn_mute)
@@ -548,17 +553,32 @@ class MainWindow(QMainWindow):
         cam_st = cam_diag["state"].upper()
         cam_age = cam_diag["last_frame_age_seconds"]
         cam_fps = cam_diag["fps"]
+        ui_fps = cam_diag.get("ui_fresh_fps", 0.0)
         cam_backend = cam_diag["backend"]
         cam_fails = cam_diag["consecutive_failures"]
         cam_reconnects = cam_diag["reconnect_attempts"]
+        p_mean = cam_diag.get("pixel_mean", 0.0)
+        p_std = cam_diag.get("pixel_std", 0.0)
+        is_black = cam_diag.get("is_black_frame", False)
 
         if cam_diag["state"] == "connected":
-            if cam_diag["is_stale"]:
+            if is_black:
+                self.diag_camera.setStyleSheet("color: #ef4444; font-weight: bold;")
+                self.diag_camera.setText(
+                    f"Camera: BLACK FRAME DETECTED ({cam_backend}) | Mean: {p_mean:.1f} Std: {p_std:.1f} | "
+                    f"Check laptop physical shutter slider / lighting!"
+                )
+            elif cam_diag["is_stale"]:
                 self.diag_camera.setStyleSheet("color: #f97316;")
-                self.diag_camera.setText(f"Camera: STALE / FROZEN ({cam_backend}) | Age: {cam_age:.1f}s | FPS: {cam_fps:.1f}")
+                self.diag_camera.setText(
+                    f"Camera: STALE / FROZEN ({cam_backend}) | No fresh frame for {cam_age:.1f}s | UI: {ui_fps:.1f} FPS"
+                )
             else:
                 self.diag_camera.setStyleSheet("color: #4ade80;")
-                self.diag_camera.setText(f"Camera: CONNECTED ({cam_backend}) | FPS: {cam_fps:.1f} | Latency: {cam_age:.2f}s")
+                self.diag_camera.setText(
+                    f"Camera: CONNECTED ({cam_backend}) | UI Fresh: {ui_fps:.1f} FPS (HW: {cam_fps:.1f}) | "
+                    f"Age: {cam_age:.2f}s | Mean: {p_mean:.1f} Std: {p_std:.1f}"
+                )
         elif cam_diag["state"] == "reconnecting":
             self.diag_camera.setStyleSheet("color: #eab308;")
             self.diag_camera.setText(f"Camera: RECONNECTING (Attempt #{cam_reconnects}) | Backend: {cam_backend} | Age: {cam_age:.1f}s")
@@ -568,7 +588,21 @@ class MainWindow(QMainWindow):
             self.diag_camera.setText(f"Camera: UNAVAILABLE ({cam_backend}) | Failures: {cam_fails} | Error: {err[:40]}")
 
         # Diagnostics: VLM Physical State Breakdown
-        if evidence.vlm_state:
+        if self.pipeline.vlm and getattr(self.pipeline.vlm, "is_paused", False):
+            self.diag_vlm.setStyleSheet("color: #eab308;")
+            self.diag_vlm.setText("VLM: PAUSED (Diagnosis Mode — Zero Inference Overhead)")
+        elif self.pipeline.vlm and getattr(self.pipeline.vlm, "is_degraded", False):
+            reason = getattr(self.pipeline.vlm, "degraded_reason", "Unavailable")
+            self.diag_vlm.setStyleSheet("color: #f97316; font-weight: bold;")
+            self.diag_vlm.setText(
+                f"VLM ({self.config.vlm.model}): DEGRADED / UNAVAILABLE ({reason})\n"
+                f"Falling back to rule-based vision + operator manual advance."
+            )
+        elif update.state == EngineState.IDLE:
+            self.diag_vlm.setStyleSheet("color: #94a3b8;")
+            self.diag_vlm.setText(f"VLM ({self.config.vlm.model}): STANDBY (Activates when session starts)")
+        elif evidence.vlm_state:
+            self.diag_vlm.setStyleSheet("color: #38bdf8;")
             st = evidence.vlm_state
             vis = "Yes" if st.get("object_visible") else "No"
             oc = st.get("open_or_closed", "unknown")
@@ -581,8 +615,10 @@ class MainWindow(QMainWindow):
                 f"Description: {desc[:60]}..." if desc else f"VLM: Visible: {vis} | State: {oc} | Location: {loc} | Conf: {conf}%"
             )
         elif self.pipeline.vlm:
+            self.diag_vlm.setStyleSheet("color: #38bdf8;")
             self.diag_vlm.setText(f"VLM ({self.config.vlm.model}): Sampling image for '{self.target_object}'...")
         else:
+            self.diag_vlm.setStyleSheet("color: #64748b;")
             self.diag_vlm.setText("VLM: Inactive / Disabled")
 
         rules_desc = f"Supporting Cues: {len(evidence.detections)} color/ROI items. Status: {update.evidence_summary}"
@@ -591,6 +627,23 @@ class MainWindow(QMainWindow):
         # Step list timeline checklist
         self.step_list_widget.set_steps(update.step_records, update.current_step_index)
         self._update_status_bar()
+
+    def _toggle_vlm_sampling(self) -> None:
+        """Toggles VLM background vision inference on/off for diagnosis."""
+        if not self.pipeline.vlm:
+            self._append_log("VLM client is not active in this run.")
+            return
+
+        if self.pipeline.vlm.is_paused:
+            self.pipeline.vlm.resume()
+            self.btn_toggle_vlm.setText("Pause VLM")
+            self.btn_toggle_vlm.setStyleSheet("background-color: #1e293b; color: white;")
+            self._append_log("Operator resumed VLM vision inference.")
+        else:
+            self.pipeline.vlm.pause()
+            self.btn_toggle_vlm.setText("Resume VLM")
+            self.btn_toggle_vlm.setStyleSheet("background-color: #854d0e; color: #fef08a;")
+            self._append_log("Operator paused VLM vision inference for diagnosis.")
 
     def _manual_confirm_step(self) -> None:
         """Operator explicitly verifies and confirms the current step."""
