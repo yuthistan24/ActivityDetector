@@ -210,6 +210,12 @@ class OllamaVlmClient(BaseVlmClient):
             if item is None or not self._running:
                 break
 
+            # Discard outdated pending frames if queued longer than 4.0s
+            queue_age = time.time() - item.get("timestamp", time.time())
+            if queue_age > 4.0:
+                logger.info(f"Discarding outdated pending VLM sample ({queue_age:.2f}s old).")
+                continue
+
             t0 = time.time()
             interp = self._query_ollama(
                 frame=item["frame"],
@@ -231,7 +237,8 @@ class OllamaVlmClient(BaseVlmClient):
         step_instruction: str,
         expected_state: Dict[str, Any],
     ) -> VlmInterpretation:
-        """Sends single frame and strict JSON prompt to Ollama."""
+        """Sends single frame and strict JSON prompt to Ollama with timeout and logging."""
+        t_start = time.time()
         try:
             import ollama  # type: ignore
 
@@ -259,12 +266,17 @@ class OllamaVlmClient(BaseVlmClient):
                 f"If the image is blurry, occluded, or inconclusive, set \"is_uncertain\": true."
             )
 
-            client = ollama.Client(host=self.config.host)
+            # Set explicit timeout so unresponsive daemon cannot hang worker
+            client = ollama.Client(host=self.config.host, timeout=20.0)
             options = {
                 "num_ctx": self.config.num_ctx,
                 "num_gpu": self.config.num_gpu,
             }
 
+            logger.info(
+                f"Submitting frame to Ollama ({self._active_model}) for '{target_object}' "
+                f"(step: '{step_name}')..."
+            )
             resp = client.chat(
                 model=self._active_model,
                 messages=[{
@@ -277,6 +289,11 @@ class OllamaVlmClient(BaseVlmClient):
 
             raw_content = resp["message"]["content"]
             schema_data, is_valid = self._parse_json_response(raw_content)
+            duration = round(time.time() - t_start, 2)
+            logger.info(
+                f"Ollama inference completed in {duration}s with {self._active_model} "
+                f"(valid={is_valid}, conf={schema_data.confidence:.2f})."
+            )
 
             return VlmInterpretation(
                 timestamp=time.time(),
@@ -285,10 +302,14 @@ class OllamaVlmClient(BaseVlmClient):
                 raw_text=raw_content,
                 model_name=self._active_model,
                 is_valid=is_valid,
+                latency_seconds=duration,
             )
 
         except Exception as e:
-            logger.warning(f"Ollama inference error with {self._active_model}: {e}")
+            duration = round(time.time() - t_start, 2)
+            logger.warning(
+                f"Ollama inference exception after {duration}s with {self._active_model}: {e}"
+            )
             fallback_schema = VlmResponseSchema(
                 object_visible=False,
                 object_description=f"Inference error: {type(e).__name__}",
@@ -306,6 +327,7 @@ class OllamaVlmClient(BaseVlmClient):
                 raw_text=str(e),
                 model_name=self._active_model,
                 is_valid=False,
+                latency_seconds=duration,
             )
 
     def _parse_json_response(self, text: str) -> Tuple[VlmResponseSchema, bool]:

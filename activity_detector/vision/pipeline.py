@@ -176,6 +176,10 @@ class VisionPipeline:
         self._render_top_banner(canvas, engine_update, fps, evidence)
         return canvas
 
+    def get_camera_diagnostics(self) -> Dict[str, Any]:
+        """Exposes live camera telemetry for UI and logging."""
+        return self.camera.get_diagnostics()
+
     def _render_top_banner(
         self,
         canvas: np.ndarray,
@@ -183,7 +187,7 @@ class VisionPipeline:
         fps: float,
         evidence: FrameEvidence,
     ) -> None:
-        """Renders top status banner with target object, step status, and telemetry."""
+        """Renders top status banner with target object, step status, camera health, and telemetry."""
         w = canvas.shape[1]
         state = update.state if update else EngineState.IDLE
         banner_color = STATE_COLORS.get(state, (100, 100, 100))
@@ -226,9 +230,22 @@ class VisionPipeline:
             sample_info = f"Stability: {int(ratio * 100)}% (Samples: {update.vlm_sample_count}/{update.required_vlm_samples})"
             cv2.putText(canvas, sample_info, (gx + gauge_w + 8, gy + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
 
-        # Right side: FPS & VLM Physical State
-        fps_text = f"FPS: {fps:4.1f}"
-        cv2.putText(canvas, fps_text, (w - 240, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 190, 205), 1, cv2.LINE_AA)
+        # Right side: Camera Health & VLM Status
+        cam_diag = self.camera.get_diagnostics()
+        cam_state = cam_diag["state"].upper()
+        cam_age = cam_diag["last_frame_age_seconds"]
+
+        if cam_diag["is_stale"] or cam_diag["state"] == "reconnecting":
+            cam_color = (40, 160, 240) if cam_diag["state"] == "reconnecting" else (50, 50, 230)
+            cam_text = f"CAM: {cam_state} ({cam_age:.1f}s)"
+        elif cam_diag["state"] == "connected":
+            cam_color = (70, 210, 100)
+            cam_text = f"CAM: {fps:4.1f} FPS [{cam_diag['backend'][:10]}]"
+        else:
+            cam_color = (50, 50, 230)
+            cam_text = f"CAM: {cam_state}"
+
+        cv2.putText(canvas, cam_text, (w - 260, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, cam_color, 1, cv2.LINE_AA)
 
         # VLM State Pill
         vlm_badge = "VLM: OFF"
@@ -245,4 +262,18 @@ class VisionPipeline:
             else:
                 vlm_badge = "VLM: Sampling image..."
                 vlm_color = (240, 180, 50)
-        cv2.putText(canvas, vlm_badge, (w - 240, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, vlm_color, 1, cv2.LINE_AA)
+        cv2.putText(canvas, vlm_badge, (w - 260, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, vlm_color, 1, cv2.LINE_AA)
+
+        # If camera is stale / frozen, render warning banner across the frame
+        if cam_diag["is_stale"] and cam_diag["state"] == "connected":
+            cv2.rectangle(canvas, (0, 56), (w, 78), (20, 20, 180), -1)
+            cv2.putText(
+                canvas,
+                f"WARNING: CAMERA FEED STALE / FROZEN (Last frame received {cam_age:.1f}s ago)",
+                (20, 72),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )

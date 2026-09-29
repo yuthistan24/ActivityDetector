@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import time
 from typing import List, Tuple
 from pydantic import BaseModel, Field
 
@@ -45,33 +46,78 @@ def run_preflight_checks(config: AppConfig) -> PreflightReport:
             message=f"Python {py_ver} is too old. Requires >= 3.9."
         ))
 
-    # 2. Camera Access Check
+    # 2. Camera Access & Sustained Capture Verification
     try:
         import cv2
         src = config.camera.source
-        cap = cv2.VideoCapture(src)
-        opened = cap.isOpened()
-        if opened:
-            ret, frame = cap.read()
+        cap = None
+        backend_name = "Default"
+
+        if isinstance(src, int):
+            cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+            backend_name = "DirectShow"
+            if not cap.isOpened():
+                if cap:
+                    cap.release()
+                cap = cv2.VideoCapture(src)
+                backend_name = "Default (MSMF/V4L2)"
+        else:
+            cap = cv2.VideoCapture(str(src))
+            backend_name = "VideoFile"
+
+        if cap and cap.isOpened():
+            # Sustained capture check: stream for 1.0 second to verify throughput & stability
+            frames_captured = 0
+            failed_reads = 0
+            last_w, last_h = 0, 0
+            t_start = time.time()
+            max_duration = 1.0
+            target_frames = 25
+
+            while (time.time() - t_start) < max_duration and frames_captured < target_frames:
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    frames_captured += 1
+                    last_h, last_w = frame.shape[:2]
+                else:
+                    failed_reads += 1
+                time.sleep(0.01)
+
+            elapsed = max(0.001, time.time() - t_start)
+            fps_measured = round(frames_captured / elapsed, 1)
             cap.release()
-            if ret and frame is not None:
-                h, w = frame.shape[:2]
+
+            if frames_captured >= 8 and failed_reads == 0:
                 checks.append(CheckResult(
                     name="Webcam Capture",
                     status="PASS",
-                    message=f"Source {src} accessible. Frame captured: {w}x{h} px."
+                    message=(
+                        f"Source {src} accessible ({backend_name}). Sustained capture verified: "
+                        f"{frames_captured} frames in {elapsed:.1f}s ({fps_measured} FPS, {last_w}x{last_h} px)."
+                    )
+                ))
+            elif frames_captured > 0:
+                checks.append(CheckResult(
+                    name="Webcam Capture",
+                    status="WARN",
+                    message=(
+                        f"Source {src} opened ({backend_name}) with drops: "
+                        f"{frames_captured} ok, {failed_reads} failed in {elapsed:.1f}s ({fps_measured} FPS)."
+                    )
                 ))
             else:
                 checks.append(CheckResult(
                     name="Webcam Capture",
                     status="WARN",
-                    message=f"Source {src} opened but initial frame read returned None."
+                    message=f"Source {src} opened ({backend_name}) but 0 frames could be read in {elapsed:.1f}s."
                 ))
         else:
+            if cap:
+                cap.release()
             checks.append(CheckResult(
                 name="Webcam Capture",
                 status="WARN",
-                message=f"Could not open source {src}. Diagnostic synthetic frames will be used."
+                message=f"Could not open source {src} ({backend_name}). Diagnostic synthetic frames will be used."
             ))
     except Exception as e:
         checks.append(CheckResult(

@@ -399,6 +399,12 @@ class MainWindow(QMainWindow):
         header.setStyleSheet("color: #94a3b8; letter-spacing: 0.5px;")
         layout.addWidget(header)
 
+        self.diag_camera = QLabel("Camera: Initializing capture stream...")
+        self.diag_camera.setFont(QFont("Segoe UI", 9))
+        self.diag_camera.setStyleSheet("color: #4ade80;")
+        self.diag_camera.setWordWrap(True)
+        layout.addWidget(self.diag_camera)
+
         self.diag_vlm = QLabel("Visual Evidence (VLM): Awaiting observation...")
         self.diag_vlm.setFont(QFont("Segoe UI", 9))
         self.diag_vlm.setStyleSheet("color: #38bdf8;")
@@ -537,6 +543,30 @@ class MainWindow(QMainWindow):
             secs = elapsed % 60
             self.session_time_label.setText(f"Elapsed: {mins:02d}:{secs:02d}")
 
+        # Diagnostics: Camera Capture Health & Latency
+        cam_diag = self.pipeline.get_camera_diagnostics()
+        cam_st = cam_diag["state"].upper()
+        cam_age = cam_diag["last_frame_age_seconds"]
+        cam_fps = cam_diag["fps"]
+        cam_backend = cam_diag["backend"]
+        cam_fails = cam_diag["consecutive_failures"]
+        cam_reconnects = cam_diag["reconnect_attempts"]
+
+        if cam_diag["state"] == "connected":
+            if cam_diag["is_stale"]:
+                self.diag_camera.setStyleSheet("color: #f97316;")
+                self.diag_camera.setText(f"Camera: STALE / FROZEN ({cam_backend}) | Age: {cam_age:.1f}s | FPS: {cam_fps:.1f}")
+            else:
+                self.diag_camera.setStyleSheet("color: #4ade80;")
+                self.diag_camera.setText(f"Camera: CONNECTED ({cam_backend}) | FPS: {cam_fps:.1f} | Latency: {cam_age:.2f}s")
+        elif cam_diag["state"] == "reconnecting":
+            self.diag_camera.setStyleSheet("color: #eab308;")
+            self.diag_camera.setText(f"Camera: RECONNECTING (Attempt #{cam_reconnects}) | Backend: {cam_backend} | Age: {cam_age:.1f}s")
+        else:
+            self.diag_camera.setStyleSheet("color: #ef4444;")
+            err = cam_diag.get("last_error") or "Device disconnected"
+            self.diag_camera.setText(f"Camera: UNAVAILABLE ({cam_backend}) | Failures: {cam_fails} | Error: {err[:40]}")
+
         # Diagnostics: VLM Physical State Breakdown
         if evidence.vlm_state:
             st = evidence.vlm_state
@@ -560,6 +590,7 @@ class MainWindow(QMainWindow):
 
         # Step list timeline checklist
         self.step_list_widget.set_steps(update.step_records, update.current_step_index)
+        self._update_status_bar()
 
     def _manual_confirm_step(self) -> None:
         """Operator explicitly verifies and confirms the current step."""
