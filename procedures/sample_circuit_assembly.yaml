@@ -1,0 +1,112 @@
+# ==============================================================================
+# EXAMPLE PROCEDURE: ELECTRONIC COMPONENT ASSEMBLY & INSPECTION
+# ==============================================================================
+# Demonstrates configuring a multi-step hardware assembly workflow.
+# Replace with your own procedure by supplying a YAML file conforming to the schema.
+# ==============================================================================
+
+id: "circuit_assembly_demo_v1"
+title: "Precision Electronic Board Assembly"
+version: "1.0.0"
+description: "Five-step protocol for circuit staging, connector seating, inspection, and transfer."
+author: "Hardware Prototyping Lab"
+
+steps:
+  - id: "step_1_esd_and_board_staging"
+    order: 1
+    name: "Stage Motherboard in Prep Zone"
+    instruction: "Place the yellow-tagged circuit board in the left staging zone."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "staging_left"
+      vlm_keywords:
+        - "circuit board"
+        - "staging"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 8
+      min_confidence: 0.65
+      hold_seconds: 1.5
+    timeout_seconds: 45.0
+
+  - id: "step_2_mount_board_on_fixture"
+    order: 2
+    name: "Transfer Board to Assembly Station"
+    instruction: "Move the board onto the central workbench fixture."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "workbench"
+        - "mounted board"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.70
+      hold_seconds: 2.0
+    timeout_seconds: 40.0
+    prerequisites:
+      - "step_1_esd_and_board_staging"
+
+  - id: "step_3_plug_cable_harness"
+    order: 3
+    name: "Connect Blue Wire Harness"
+    instruction: "Introduce the blue wiring harness and mate it with the central socket."
+    expected_evidence:
+      required_colors:
+        - "blue_reagent"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "blue wire"
+        - "harness"
+        - "plugging"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.70
+      hold_seconds: 2.0
+    timeout_seconds: 50.0
+    prerequisites:
+      - "step_2_mount_board_on_fixture"
+
+  - id: "step_4_continuity_probe_check"
+    order: 4
+    name: "Verify Green Indicator LED"
+    instruction: "Power the board and verify the green test status indicator."
+    expected_evidence:
+      required_colors:
+        - "green_indicator"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "green led"
+        - "power indicator"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.65
+      hold_seconds: 2.0
+    timeout_seconds: 45.0
+    prerequisites:
+      - "step_3_plug_cable_harness"
+
+  - id: "step_5_transfer_to_finished_dock"
+    order: 5
+    name: "Transfer Completed Unit to Outbox"
+    instruction: "Transfer the assembled unit to the right-side completed rack."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "disposal_right"
+      vlm_keywords:
+        - "completed rack"
+        - "packaged unit"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.65
+      hold_seconds: 2.0
+    timeout_seconds: 45.0
+    prerequisites:
+      - "step_4_continuity_probe_check"

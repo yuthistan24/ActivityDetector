@@ -1,0 +1,140 @@
+# ==============================================================================
+# EXAMPLE PROCEDURE: ACID-BASE TITRATION & REAGENT PREPARATION
+# ==============================================================================
+# NOTE FOR USERS & LAB TEAMS:
+# This file is an explicitly labeled example procedure for demonstration and
+# testing. You can replace this file or point the application to your own custom
+# procedure YAML file by setting 'procedure_file' in default_config.yaml or via:
+#   python run.py --procedure path/to/your_procedure.yaml
+#
+# Schema Reference:
+# - id: Unique string identifier for the procedure
+# - title: Human-readable experiment title
+# - version: Semantic version string
+# - steps: Ordered list of steps with validation rules:
+#     - id: Unique step key (e.g. step_1_safety)
+#     - order: 1-based sequential integer
+#     - name: Concise title displayed on HUD and status cards
+#     - instruction: Spoken and displayed guidance for the operator
+#     - expected_evidence:
+#         - required_colors: [blue_reagent, yellow_flask, red_pipette, green_indicator]
+#         - required_objects: [person, bottle, cup]
+#         - roi: workbench_center | staging_left | disposal_right
+#         - vlm_keywords: Narrative hints for the local VLM
+#     - completion_rule:
+#         - rule_type: stable_detection | vlm_confirmation | duration_hold | hybrid
+#         - stable_frames: Consecutive matching frames required to advance (e.g. 10)
+#         - min_confidence: Threshold 0.0 - 1.0 (default: 0.60)
+#         - hold_seconds: Duration evidence must remain stable in seconds
+#     - timeout_seconds: Optional duration before alerting the operator
+# ==============================================================================
+
+id: "titration_exp_demo_v1"
+title: "Acid-Base Titration & Reagent Mixing"
+version: "1.0.0"
+description: "Five-step protocol for titration preparation, solution transfer, indicator verification, and waste staging."
+author: "Laboratory Safety & Automation Group"
+
+steps:
+  - id: "step_1_safety_and_staging"
+    order: 1
+    name: "Inspect Safety & Staging Area"
+    instruction: "Ensure PPE is equipped and place the yellow reagent flask in the staging area."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "staging_left"
+      vlm_keywords:
+        - "gloves"
+        - "container"
+        - "staging"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 8
+      min_confidence: 0.65
+      hold_seconds: 1.5
+    timeout_seconds: 45.0
+
+  - id: "step_2_transfer_flask_to_workbench"
+    order: 2
+    name: "Transfer Reaction Flask to Center"
+    instruction: "Move the yellow reaction flask from staging into the active workbench center."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "flask"
+        - "workbench"
+        - "center"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.70
+      hold_seconds: 2.0
+    timeout_seconds: 40.0
+    prerequisites:
+      - "step_1_safety_and_staging"
+
+  - id: "step_3_introduce_titrant"
+    order: 3
+    name: "Introduce Blue Titrant Reagent"
+    instruction: "Introduce the blue titrant solution into the center workbench adjacent to the flask."
+    expected_evidence:
+      required_colors:
+        - "blue_reagent"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "blue vial"
+        - "titrant"
+        - "pipetting"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.70
+      hold_seconds: 2.0
+    timeout_seconds: 60.0
+    prerequisites:
+      - "step_2_transfer_flask_to_workbench"
+
+  - id: "step_4_observe_indicator_transition"
+    order: 4
+    name: "Verify Indicator Neutralization"
+    instruction: "Dispense the indicator and verify the green neutral solution reaction in the flask."
+    expected_evidence:
+      required_colors:
+        - "green_indicator"
+      roi: "workbench_center"
+      vlm_keywords:
+        - "green solution"
+        - "neutralization"
+        - "reaction"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.65
+      hold_seconds: 2.0
+    timeout_seconds: 60.0
+    prerequisites:
+      - "step_3_introduce_titrant"
+
+  - id: "step_5_disposal_and_shutdown"
+    order: 5
+    name: "Transfer Waste to Disposal Zone"
+    instruction: "Move completed sample and spent containers to the right disposal station."
+    expected_evidence:
+      required_colors:
+        - "yellow_flask"
+      roi: "disposal_right"
+      vlm_keywords:
+        - "disposal"
+        - "waste"
+        - "clean bench"
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 10
+      min_confidence: 0.65
+      hold_seconds: 2.0
+    timeout_seconds: 45.0
+    prerequisites:
+      - "step_4_observe_indicator_transition"
