@@ -109,7 +109,8 @@ class StreamingConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """Master application configuration."""
-    procedure_file: str = Field(default="procedures/sample_titration_experiment.yaml")
+    procedure_file: str = Field(default="procedures/default_notebook_handling.yaml")
+    target_object: str = Field(default="notebook", description="Selected object to monitor")
     camera: CameraConfig = Field(default_factory=CameraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     yolo: YoloConfig = Field(default_factory=YoloConfig)
@@ -120,26 +121,24 @@ class AppConfig(BaseModel):
 
 
 def get_default_config() -> AppConfig:
-    """Returns standard default configuration with default ROIs and color definitions."""
+    """Returns standard default configuration with generic object handling settings."""
     return AppConfig(
-        procedure_file="procedures/sample_titration_experiment.yaml",
+        procedure_file="procedures/default_notebook_handling.yaml",
+        target_object="notebook",
         camera=CameraConfig(source=0, width=1280, height=720, fps=30),
         vision=VisionConfig(
             min_contour_area=700,
             rois={
-                "workbench_center": RoiRule(x1=0.25, y1=0.25, x2=0.75, y2=0.85),
-                "staging_left": RoiRule(x1=0.04, y1=0.25, x2=0.24, y2=0.85),
-                "disposal_right": RoiRule(x1=0.76, y1=0.25, x2=0.96, y2=0.85),
+                "workspace_center": RoiRule(x1=0.20, y1=0.20, x2=0.70, y2=0.85),
+                "stowed_area": RoiRule(x1=0.72, y1=0.20, x2=0.98, y2=0.85),
+                "prep_left": RoiRule(x1=0.02, y1=0.20, x2=0.18, y2=0.85),
             },
             colors={
-                # Blue reagent / vial / liquid
-                "blue_reagent": ColorRule(h_min=100, s_min=110, v_min=60, h_max=130, s_max=255, v_max=255),
-                # Yellow chemical container / flask
-                "yellow_flask": ColorRule(h_min=18, s_min=100, v_min=100, h_max=35, s_max=255, v_max=255),
-                # Red marker / cap / tool
-                "red_pipette": ColorRule(h_min=0, s_min=120, v_min=70, h_max=10, s_max=255, v_max=255),
-                # Green indicator / solution
-                "green_indicator": ColorRule(h_min=38, s_min=80, v_min=50, h_max=85, s_max=255, v_max=255),
+                # Optional supporting color cues (e.g. for color-tagged items)
+                "blue_marker": ColorRule(h_min=100, s_min=110, v_min=60, h_max=130, s_max=255, v_max=255),
+                "yellow_cover": ColorRule(h_min=18, s_min=100, v_min=100, h_max=35, s_max=255, v_max=255),
+                "red_tag": ColorRule(h_min=0, s_min=120, v_min=70, h_max=10, s_max=255, v_max=255),
+                "green_mat": ColorRule(h_min=38, s_min=80, v_min=50, h_max=85, s_max=255, v_max=255),
             }
         ),
         yolo=YoloConfig(enabled=False, model_path="", confidence_threshold=0.45),

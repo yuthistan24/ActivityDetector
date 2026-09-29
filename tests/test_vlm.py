@@ -1,4 +1,4 @@
-"""Unit tests for VLM schema parsing and client interfaces."""
+"""Unit tests for VLM schema parsing, generic object state validation, and client interfaces."""
 
 import numpy as np
 import pytest
@@ -13,18 +13,24 @@ from activity_detector.vision.vlm import (
 
 
 def test_vlm_response_schema_validation():
+    # Valid generic object observation
     data = {
-        "step_recognized": True,
-        "action_description": "Operator positioned yellow container",
-        "detected_items": ["yellow_flask", "person"],
+        "object_visible": True,
+        "object_description": "Blue spiral notebook with white lined pages",
+        "open_or_closed": "open",
+        "held_or_on_surface": "on_surface",
+        "location": "workspace_center",
         "confidence": 0.88,
         "is_uncertain": False,
-        "reasoning": "Container is steady on workbench."
+        "reasoning": "Notebook is resting open flat on the mat with pages clearly visible.",
     }
     schema = VlmResponseSchema.model_validate(data)
-    assert schema.step_recognized is True
+    assert schema.object_visible is True
+    assert schema.open_or_closed == "open"
+    assert schema.location == "workspace_center"
     assert schema.confidence == 0.88
-    assert "yellow_flask" in schema.detected_items
+    assert schema.is_uncertain is False
+    assert "spiral notebook" in schema.object_description
 
 
 def test_vlm_json_extractor_from_markdown():
@@ -32,25 +38,28 @@ def test_vlm_json_extractor_from_markdown():
 
     # Raw response with markdown code fences
     raw_markdown = """
-    Here is the analysis:
+    Here is the physical analysis:
     ```json
     {
-      "step_recognized": true,
-      "action_description": "Adding reagent",
-      "detected_items": ["blue_reagent"],
-      "confidence": 0.75,
+      "object_visible": true,
+      "object_description": "Black cover notebook",
+      "open_or_closed": "closed",
+      "held_or_on_surface": "held",
+      "location": "workspace_center",
+      "confidence": 0.82,
       "is_uncertain": false,
-      "reasoning": "Reagent bottle in hand"
+      "reasoning": "Operator is holding closed notebook with both hands."
     }
     ```
     """
     schema, ok = client._parse_json_response(raw_markdown)
     assert ok is True
-    assert schema.step_recognized is True
-    assert schema.confidence == 0.75
+    assert schema.object_visible is True
+    assert schema.open_or_closed == "closed"
+    assert schema.confidence == 0.82
 
-    # Invalid JSON string
-    bad_raw = "I am an AI and I cannot verify this."
+    # Ambiguous or invalid JSON response
+    bad_raw = "I am unsure whether the notebook is open or closed because the lighting is too dark."
     schema_bad, ok_bad = client._parse_json_response(bad_raw)
     assert ok_bad is False
     assert schema_bad.is_uncertain is True
@@ -58,20 +67,29 @@ def test_vlm_json_extractor_from_markdown():
 
 
 def test_mock_vlm_client():
-    mock = MockVlmClient(mock_step_recognized=True, mock_confidence=0.92)
+    mock = MockVlmClient(
+        mock_object_visible=True,
+        mock_open_closed="open",
+        mock_location="workspace_center",
+        mock_confidence=0.92,
+        mock_uncertain=False,
+    )
     health = mock.check_health()
     assert health.available is True
 
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
     submitted = mock.submit_sample(
         frame=frame,
-        step_name="Safety Check",
-        step_instruction="Put on gloves",
-        expected_items=["gloves"]
+        target_object="notebook",
+        step_name="Open Notebook",
+        step_instruction="Open the notebook flat",
+        expected_state={"object_visible": True, "open_or_closed": "open"}
     )
     assert submitted is True
 
     latest = mock.get_latest_interpretation()
     assert latest is not None
-    assert latest.schema_data.step_recognized is True
+    assert latest.schema_data.object_visible is True
+    assert latest.schema_data.open_or_closed == "open"
     assert latest.schema_data.confidence == 0.92
+    assert latest.target_object == "notebook"

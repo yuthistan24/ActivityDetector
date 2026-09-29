@@ -7,12 +7,13 @@ from pathlib import Path
 import time
 from typing import Optional
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -58,10 +59,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.procedure = procedure
+        self.target_object: str = procedure.target_object or getattr(config, "target_object", "notebook")
 
         # Core subsystems
         self.engine = ProcedureEngine(self.procedure)
+        self.engine.set_target_object(self.target_object)
+
         self.pipeline = VisionPipeline(self.config)
+        self.pipeline.set_target_object(self.target_object)
+
         self.speech = SpeechPrompter(self.config.audio)
         self.session_manager = SessionManager(self.config.recording.output_dir)
         self.recorder = VideoRecorder(self.config.recording)
@@ -83,7 +89,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._process_tick)
 
     def _init_window(self) -> None:
-        self.setWindowTitle("ActivityDetector — Offline Procedure Monitoring System")
+        self.setWindowTitle("ActivityDetector — Tabletop Procedure Monitoring Prototype")
         self.resize(1380, 840)
         self.setMinimumSize(1024, 680)
         self.setStyleSheet("""
@@ -99,7 +105,7 @@ class MainWindow(QMainWindow):
                 color: #f8fafc;
                 border: 1px solid #334155;
                 border-radius: 6px;
-                padding: 8px 14px;
+                padding: 7px 12px;
                 font-weight: 600;
                 font-size: 11px;
             }
@@ -225,7 +231,7 @@ class MainWindow(QMainWindow):
         app_title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         app_title.setStyleSheet("color: #38bdf8; letter-spacing: 1px;")
 
-        app_subtitle = QLabel("Offline Prototype • Sequential Procedure Verification • Deterministic Vision & Local VLM")
+        app_subtitle = QLabel("Tabletop Prototype • Generic Object Tracking • Local Vision & Explainable State Machine")
         app_subtitle.setFont(QFont("Segoe UI", 9))
         app_subtitle.setStyleSheet("color: #64748b;")
 
@@ -234,6 +240,35 @@ class MainWindow(QMainWindow):
         header.addLayout(title_col)
 
         header.addStretch()
+
+        # Target Object selector / input
+        target_layout = QHBoxLayout()
+        lbl_target = QLabel("Target Object:")
+        lbl_target.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        lbl_target.setStyleSheet("color: #94a3b8;")
+
+        self.input_target_object = QLineEdit(self.target_object)
+        self.input_target_object.setFixedWidth(120)
+        self.input_target_object.setStyleSheet("""
+            QLineEdit {
+                background-color: #1e293b;
+                color: #38bdf8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+        """)
+        self.btn_set_target = QPushButton("Set")
+        self.btn_set_target.clicked.connect(self._on_target_object_changed)
+
+        target_layout.addWidget(lbl_target)
+        target_layout.addWidget(self.input_target_object)
+        target_layout.addWidget(self.btn_set_target)
+        header.addLayout(target_layout)
+
+        header.addSpacing(10)
 
         # Status badge
         self.status_badge = StatusBadgeWidget()
@@ -251,24 +286,27 @@ class MainWindow(QMainWindow):
         frame.setStyleSheet("background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 6px;")
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         self.btn_session = QPushButton("Start Session")
         self.btn_session.setStyleSheet("background-color: #0284c7; color: white; border: none;")
         self.btn_session.clicked.connect(self._toggle_session)
         layout.addWidget(self.btn_session)
 
-        self.btn_record = QPushButton("Record Video")
-        self.btn_record.clicked.connect(self._toggle_recording)
-        layout.addWidget(self.btn_record)
+        # Operator verification controls
+        self.btn_confirm = QPushButton("Confirm Step (Manual)")
+        self.btn_confirm.setStyleSheet("background-color: #059669; color: white; border: none;")
+        self.btn_confirm.clicked.connect(self._manual_confirm_step)
+        layout.addWidget(self.btn_confirm)
 
-        self.btn_mute = QPushButton("Mute Audio" if not self.speech.is_muted else "Unmute Audio")
-        self.btn_mute.clicked.connect(self._toggle_mute)
-        layout.addWidget(self.btn_mute)
+        self.btn_flag = QPushButton("Flag Inconclusive")
+        self.btn_flag.setStyleSheet("background-color: #d97706; color: white; border: none;")
+        self.btn_flag.clicked.connect(self._manual_flag_uncertain)
+        layout.addWidget(self.btn_flag)
 
-        layout.addSpacing(10)
+        layout.addSpacing(6)
 
-        # Operator manual controls
+        # Navigation controls
         self.btn_prev = QPushButton("◀ Step Back")
         self.btn_prev.clicked.connect(self._manual_prev_step)
         layout.addWidget(self.btn_prev)
@@ -277,12 +315,20 @@ class MainWindow(QMainWindow):
         self.btn_next.clicked.connect(self._manual_next_step)
         layout.addWidget(self.btn_next)
 
-        self.btn_ack = QPushButton("Acknowledge Alerts")
+        self.btn_ack = QPushButton("Ack Alerts")
         self.btn_ack.setStyleSheet("background-color: #78350f; color: #fde68a;")
         self.btn_ack.clicked.connect(self._acknowledge_alerts)
         layout.addWidget(self.btn_ack)
 
         layout.addStretch()
+
+        self.btn_record = QPushButton("Record Video")
+        self.btn_record.clicked.connect(self._toggle_recording)
+        layout.addWidget(self.btn_record)
+
+        self.btn_mute = QPushButton("Mute Audio" if not self.speech.is_muted else "Unmute Audio")
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        layout.addWidget(self.btn_mute)
 
         self.btn_load_proc = QPushButton("Load Procedure...")
         self.btn_load_proc.clicked.connect(self._load_custom_procedure)
@@ -348,27 +394,26 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
 
-        header = QLabel("EVIDENCE & DIAGNOSTICS")
+        header = QLabel("EVIDENCE & VISUAL DIAGNOSTICS")
         header.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         header.setStyleSheet("color: #94a3b8; letter-spacing: 0.5px;")
         layout.addWidget(header)
 
-        self.diag_rules = QLabel("Rules: Awaiting frame...")
-        self.diag_rules.setFont(QFont("Segoe UI", 9))
-        self.diag_rules.setStyleSheet("color: #38bdf8;")
-        self.diag_rules.setWordWrap(True)
-        layout.addWidget(self.diag_rules)
-
-        self.diag_vlm = QLabel("VLM: Idle")
+        self.diag_vlm = QLabel("Visual Evidence (VLM): Awaiting observation...")
         self.diag_vlm.setFont(QFont("Segoe UI", 9))
-        self.diag_vlm.setStyleSheet("color: #a78bfa;")
+        self.diag_vlm.setStyleSheet("color: #38bdf8;")
         self.diag_vlm.setWordWrap(True)
         layout.addWidget(self.diag_vlm)
+
+        self.diag_rules = QLabel("Supporting Vision: Online")
+        self.diag_rules.setFont(QFont("Segoe UI", 9))
+        self.diag_rules.setStyleSheet("color: #94a3b8;")
+        self.diag_rules.setWordWrap(True)
+        layout.addWidget(self.diag_rules)
 
         return frame
 
     def _connect_signals(self) -> None:
-        # Register voice announcements on engine events
         self.engine.register_transition_listener(self._on_step_transition)
         self.engine.register_warning_listener(self._on_engine_warning)
 
@@ -383,7 +428,16 @@ class MainWindow(QMainWindow):
         """Launches the window and starts capture."""
         self.show()
         self._start_pipeline()
-        self._append_log("System initialized. Camera pipeline online.")
+        self._append_log(f"System initialized. Target object: '{self.target_object}'")
+
+    def _on_target_object_changed(self) -> None:
+        """Handler for target object text update."""
+        new_obj = self.input_target_object.text().strip()
+        if new_obj:
+            self.target_object = new_obj
+            self.pipeline.set_target_object(new_obj)
+            self.engine.set_target_object(new_obj)
+            self._append_log(f"Target object set to: '{new_obj}'")
 
     def _process_tick(self) -> None:
         """Called every ~33ms: grabs frame, processes detections, updates engine & UI."""
@@ -401,6 +455,7 @@ class MainWindow(QMainWindow):
                 evidence_summary="",
                 evidence_source="none",
                 transition_occurred=False,
+                vlm_sample_count=self.engine._vlm_consistent_sample_count,
             )
         )
 
@@ -421,7 +476,6 @@ class MainWindow(QMainWindow):
             if record_frame is not None:
                 self.recorder.push_frame(record_frame)
 
-            # Check for recorder error
             if self.recorder.has_error:
                 self.rec_error_banner.setText(f"RECORDING ERROR: {self.recorder.error_message}")
                 self.rec_error_banner.setVisible(True)
@@ -448,7 +502,7 @@ class MainWindow(QMainWindow):
                 total=len(self.procedure.steps),
                 name=curr.name,
                 instruction=curr.instruction,
-                evidence_summary=update.evidence_summary or "Awaiting expected objects/colors",
+                evidence_summary=update.evidence_summary or f"Awaiting physical evidence of '{self.target_object}'",
                 stability_ratio=update.stability_ratio,
             )
         elif update.state == EngineState.COMPLETED:
@@ -483,31 +537,52 @@ class MainWindow(QMainWindow):
             secs = elapsed % 60
             self.session_time_label.setText(f"Elapsed: {mins:02d}:{secs:02d}")
 
-        # Diagnostics: Rules vs VLM breakdown
-        rules_desc = f"Deterministic Rules: {len(evidence.detections)} item(s) detected. {update.evidence_summary}"
-        self.diag_rules.setText(rules_desc)
-
-        if evidence.vlm_summary:
-            conf_str = f" ({int(evidence.vlm_confidence * 100)}%)" if evidence.vlm_confidence else ""
-            uncertain_str = " [UNCERTAIN]" if evidence.vlm_uncertain else ""
-            self.diag_vlm.setText(f"VLM ({self.config.vlm.model}): \"{evidence.vlm_summary}\"{conf_str}{uncertain_str}")
+        # Diagnostics: VLM Physical State Breakdown
+        if evidence.vlm_state:
+            st = evidence.vlm_state
+            vis = "Yes" if st.get("object_visible") else "No"
+            oc = st.get("open_or_closed", "unknown")
+            loc = st.get("location", "unknown")
+            conf = int(st.get("confidence", 0.0) * 100)
+            uncertain = " [UNCERTAIN / REVIEW]" if st.get("is_uncertain") else ""
+            desc = st.get("object_description", "")
+            self.diag_vlm.setText(
+                f"VLM ({self.config.vlm.model}): Visible: {vis} | State: {oc} | Location: {loc} | Conf: {conf}%{uncertain}\n"
+                f"Description: {desc[:60]}..." if desc else f"VLM: Visible: {vis} | State: {oc} | Location: {loc} | Conf: {conf}%"
+            )
         elif self.pipeline.vlm:
-            self.diag_vlm.setText(f"VLM ({self.config.vlm.model}): Sampling image...")
+            self.diag_vlm.setText(f"VLM ({self.config.vlm.model}): Sampling image for '{self.target_object}'...")
         else:
             self.diag_vlm.setText("VLM: Inactive / Disabled")
+
+        rules_desc = f"Supporting Cues: {len(evidence.detections)} color/ROI items. Status: {update.evidence_summary}"
+        self.diag_rules.setText(rules_desc)
 
         # Step list timeline checklist
         self.step_list_widget.set_steps(update.step_records, update.current_step_index)
 
+    def _manual_confirm_step(self) -> None:
+        """Operator explicitly verifies and confirms the current step."""
+        ok = self.engine.confirm_current_step(reason="operator_confirmed")
+        if ok:
+            curr = self.procedure.get_step_by_index(self.engine.current_step_index)
+            if curr:
+                self.speech.announce_step(curr.order, curr.name, curr.instruction)
+            self._append_log("Operator confirmed step completion.")
+
+    def _manual_flag_uncertain(self) -> None:
+        """Operator flags current observation as ambiguous or inconclusive."""
+        ok = self.engine.flag_uncertain_step(reason="operator_flagged_uncertain")
+        if ok:
+            self._append_log("Operator flagged step as inconclusive/uncertain.")
+
     def _toggle_session(self) -> None:
         """Starts or stops the active monitoring session."""
         if not self.session_manager.is_active:
-            # START SESSION
             session_dir = self.session_manager.start_session(self.procedure)
             self._session_start_time = time.time()
             self.engine.start_session()
 
-            # Auto-start video recording if configured
             if self.config.recording.auto_record_on_session_start:
                 self.recorder.start_recording(
                     target_directory=session_dir,
@@ -520,15 +595,13 @@ class MainWindow(QMainWindow):
 
             self.btn_session.setText("Stop Session")
             self.btn_session.setStyleSheet("background-color: #dc2626; color: white; border: none;")
-            self._append_log(f"Session started: {self.session_manager.current_session_id}")
+            self._append_log(f"Session started for target '{self.target_object}': {self.session_manager.current_session_id}")
 
-            # Announce step 1
             if self.procedure.steps:
                 s1 = self.procedure.steps[0]
                 self.speech.announce_step(s1.order, s1.name, s1.instruction)
 
         else:
-            # STOP SESSION
             video_file = self.recorder.stop_recording()
             if video_file:
                 self.session_manager.record_video_status(video_file, success=not self.recorder.has_error)
@@ -606,8 +679,15 @@ class MainWindow(QMainWindow):
             try:
                 new_proc = load_procedure(path)
                 self.procedure = new_proc
+                self.target_object = new_proc.target_object or self.target_object
+                self.input_target_object.setText(self.target_object)
+
                 self.engine = ProcedureEngine(self.procedure)
+                self.engine.set_target_object(self.target_object)
+
+                self.pipeline.set_target_object(self.target_object)
                 self._connect_signals()
+
                 self.proc_title_label.setText(new_proc.title)
                 self.proc_ver_label.setText(f"v{new_proc.version}")
                 self._append_log(f"Loaded procedure: '{new_proc.title}' ({len(new_proc.steps)} steps)")
@@ -616,7 +696,6 @@ class MainWindow(QMainWindow):
 
     def _on_step_transition(self, record: StepRecord) -> None:
         self._append_log(f"Completed Step {record.order}: '{record.name}' in {record.duration_seconds}s ({record.evidence_source})")
-        # Announce next step
         nxt = self.procedure.get_step_by_index(self.engine.current_step_index)
         if nxt:
             self.speech.announce_step(nxt.order, nxt.name, nxt.instruction)
@@ -635,7 +714,7 @@ class MainWindow(QMainWindow):
         vlm_model = self.config.vlm.model if self.config.vlm.enabled else "Disabled"
         cam_src = self.config.camera.source
         streaming_status = f"Stream: http://{self.config.streaming.host}:{self.config.streaming.port}{self.config.streaming.path}" if self.config.streaming.enabled else "Streaming: Off"
-        msg = f"Camera Source: {cam_src} | Local VLM: {vlm_model} | {streaming_status} | Output: {self.config.recording.output_dir}/"
+        msg = f"Camera Source: {cam_src} | Target: {self.target_object} | Local VLM: {vlm_model} | {streaming_status} | Output: {self.config.recording.output_dir}/"
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, event) -> None:  # type: ignore

@@ -1,7 +1,8 @@
-# ActivityDetector Default Configuration
-# All paths and parameters can be overridden here or via CLI flags.
+# ActivityDetector Configuration (Tabletop Generic Object Monitoring Prototype)
+# All parameters can be overridden here or via CLI flags.
 
-procedure_file: "procedures/sample_titration_experiment.yaml"
+procedure_file: "procedures/default_notebook_handling.yaml"
+target_object: "notebook"
 
 camera:
   # Camera index (0, 1, ...) or path to local test video file (e.g. "test_clip.mp4")
@@ -11,51 +12,51 @@ camera:
   fps: 30
 
 vision:
-  # Minimum contour area in pixels to reject noise
+  # Minimum contour area in pixels for optional supporting color contours
   min_contour_area: 700
 
-  # Regions of interest (normalized coordinates 0.0 to 1.0)
+  # Tabletop Regions of Interest (normalized coordinates 0.0 to 1.0)
   rois:
-    workbench_center:
-      x1: 0.25
-      y1: 0.25
-      x2: 0.75
+    workspace_center:
+      x1: 0.20
+      y1: 0.20
+      x2: 0.70
       y2: 0.85
-    staging_left:
-      x1: 0.04
-      y1: 0.25
-      x2: 0.24
+    stowed_area:
+      x1: 0.72
+      y1: 0.20
+      x2: 0.98
       y2: 0.85
-    disposal_right:
-      x1: 0.76
-      y1: 0.25
-      x2: 0.96
+    prep_left:
+      x1: 0.02
+      y1: 0.20
+      x2: 0.18
       y2: 0.85
 
-  # HSV Color thresholds for deterministic object identification
+  # Optional supporting color thresholds (if using colored items/tags)
   colors:
-    blue_reagent:
-      h_min: 100
-      s_min: 110
-      v_min: 60
-      h_max: 130
-      s_max: 255
-      v_max: 255
-    yellow_flask:
+    yellow_cover:
       h_min: 18
       s_min: 100
       v_min: 100
       h_max: 35
       s_max: 255
       v_max: 255
-    red_pipette:
+    blue_marker:
+      h_min: 100
+      s_min: 110
+      v_min: 60
+      h_max: 130
+      s_max: 255
+      v_max: 255
+    red_tag:
       h_min: 0
       s_min: 120
       v_min: 70
       h_max: 10
       s_max: 255
       v_max: 255
-    green_indicator:
+    green_mat:
       h_min: 38
       s_min: 80
       v_min: 50
@@ -64,7 +65,7 @@ vision:
       v_max: 255
 
 yolo:
-  # Optional local detector (e.g. YOLOv8 / YOLO11 for person/bottle/cup)
+  # Optional local detector (e.g. YOLOv8 / YOLO11 for person/book/cell phone)
   enabled: false
   model_path: ""
   confidence_threshold: 0.45

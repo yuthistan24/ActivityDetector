@@ -91,6 +91,14 @@ def test_invalid_prerequisite_rejected():
 
 
 def test_load_sample_procedures():
+    notebook_path = Path("procedures/default_notebook_handling.yaml")
+    assert notebook_path.exists()
+    notebook_proc = load_procedure(notebook_path)
+    assert notebook_proc.id == "notebook_handling_protocol_v1"
+    assert notebook_proc.target_object == "notebook"
+    assert len(notebook_proc.steps) == 4
+    assert notebook_proc.steps[0].expected_evidence.target_object == "notebook"
+
     titration_path = Path("procedures/sample_titration_experiment.yaml")
     assert titration_path.exists()
     proc = load_procedure(titration_path)

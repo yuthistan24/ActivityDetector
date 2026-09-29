@@ -18,8 +18,9 @@ def test_default_config_validity():
     assert isinstance(cfg, AppConfig)
     assert cfg.camera.fps == 30
     assert cfg.vision.min_contour_area > 0
-    assert "workbench_center" in cfg.vision.rois
-    assert "blue_reagent" in cfg.vision.colors
+    assert "workspace_center" in cfg.vision.rois
+    assert "stowed_area" in cfg.vision.rois
+    assert cfg.target_object == "notebook"
 
 
 def test_roi_rule_validation():

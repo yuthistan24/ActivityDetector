@@ -1,4 +1,4 @@
-"""Procedure Sequence Engine: deterministic step progression and error tracking."""
+"""Procedure Sequence Engine: deterministic step progression, generic object tracking, and error validation."""
 
 from __future__ import annotations
 
@@ -80,9 +80,12 @@ class FrameEvidence(BaseModel):
     frame_number: int
     timestamp: float = Field(default_factory=time.time)
     detections: List[DetectionItem] = Field(default_factory=list)
+    target_object: str = "notebook"
+    vlm_state: Dict[str, Any] = Field(default_factory=dict)
     vlm_summary: Optional[str] = None
     vlm_confidence: Optional[float] = None
     vlm_uncertain: bool = False
+    vlm_sample_id: Optional[str] = None
 
 
 class EngineUpdate(BaseModel):
@@ -99,13 +102,16 @@ class EngineUpdate(BaseModel):
     evidence_source: str = "deterministic_rules"
     transition_occurred: bool = False
     completed_step_id: Optional[str] = None
+    vlm_sample_count: int = 0
+    required_vlm_samples: int = 2
 
 
 class ProcedureEngine:
-    """Deterministic sequence validator and state machine."""
+    """Deterministic sequence validator and state machine tracking physical object state across time."""
 
     def __init__(self, procedure: Procedure) -> None:
         self.procedure = procedure
+        self.target_object: str = procedure.target_object or "notebook"
         self.state: EngineState = EngineState.IDLE
         self.current_step_index: int = 0
         self.step_records: List[StepRecord] = []
@@ -115,6 +121,10 @@ class ProcedureEngine:
         # Multi-frame stability tracking
         self._consecutive_match_frames: int = 0
         self._stable_start_time: Optional[float] = None
+
+        # Multi-observation VLM sample tracking (ensures single frame cannot advance step)
+        self._vlm_consistent_sample_count: int = 0
+        self._last_processed_vlm_sample_id: Optional[str] = None
 
         # Look-ahead stability tracking for skipped steps
         self._future_step_match_counters: Dict[str, int] = {}
@@ -145,6 +155,10 @@ class ProcedureEngine:
             for step in self.procedure.steps
         ]
 
+    def set_target_object(self, object_name: str) -> None:
+        """Updates the target object to monitor (e.g. 'notebook', 'sample container')."""
+        self.target_object = object_name.strip() or "notebook"
+
     def register_transition_listener(self, callback: Callable[[StepRecord], None]) -> None:
         """Adds a callback invoked when a step completes and transitions."""
         self._on_transition_listeners.append(callback)
@@ -162,6 +176,8 @@ class ProcedureEngine:
         self.history_warnings.clear()
         self._consecutive_match_frames = 0
         self._stable_start_time = None
+        self._vlm_consistent_sample_count = 0
+        self._last_processed_vlm_sample_id = None
         self._future_step_match_counters.clear()
         self._past_step_match_counters.clear()
         self._timeout_warned_steps.clear()
@@ -193,7 +209,7 @@ class ProcedureEngine:
         completed_step_id: Optional[str] = None
         recent_warning: Optional[WarningEvent] = None
         evidence_summary = ""
-        evidence_source = "deterministic_rules"
+        evidence_source = "vlm_state_tracking"
         stability_ratio = 0.0
 
         if self.state == EngineState.IDLE or self.current_step_index >= len(self.procedure.steps):
@@ -212,6 +228,7 @@ class ProcedureEngine:
                 evidence_summary="Session Idle" if self.state == EngineState.IDLE else "Procedure Completed",
                 evidence_source="none",
                 transition_occurred=False,
+                vlm_sample_count=self._vlm_consistent_sample_count,
             )
 
         current_step = self.procedure.steps[self.current_step_index]
@@ -228,7 +245,7 @@ class ProcedureEngine:
             elapsed_sec = int(now - self._current_step_start_time)
             warning = WarningEvent(
                 warning_type=WarningType.STEP_TIMEOUT,
-                message=f"Step '{current_step.name}' timeout: running for {elapsed_sec}s (limit {int(current_step.timeout_seconds)}s).",
+                message=f"Step '{current_step.name}' timeout: active for {elapsed_sec}s (limit {int(current_step.timeout_seconds)}s).",
                 step_id=current_step.id,
                 timestamp=now,
                 details={"elapsed_seconds": elapsed_sec, "timeout_seconds": current_step.timeout_seconds}
@@ -244,24 +261,38 @@ class ProcedureEngine:
         evidence_summary = match_desc
         evidence_source = current_source
 
-        # 3. Handle VLM uncertainty flag
+        # 3. Handle VLM uncertainty flag or invalid low-confidence response
         if evidence.vlm_uncertain and evidence.vlm_summary:
             if self.state != EngineState.NEEDS_ATTENTION:
                 self.state = EngineState.UNCERTAIN
                 uncertain_warn = WarningEvent(
                     warning_type=WarningType.UNCERTAIN_EVIDENCE,
-                    message=f"VLM uncertain on Step '{current_step.name}': {evidence.vlm_summary}",
+                    message=f"Visual evidence ambiguous on Step '{current_step.name}': {evidence.vlm_summary}",
                     step_id=current_step.id,
                     timestamp=now
                 )
                 self._emit_warning(uncertain_warn)
                 recent_warning = uncertain_warn
 
-        # 4. Multi-frame stability accumulation for current step
+        # 4. Multi-observation tracking for VLM samples
+        # A single frame must NEVER advance a step. If rule uses VLM, require min_vlm_samples.
+        req_vlm_samples = current_step.completion_rule.min_vlm_samples
+        if evidence.vlm_sample_id and evidence.vlm_sample_id != self._last_processed_vlm_sample_id:
+            self._last_processed_vlm_sample_id = evidence.vlm_sample_id
+            if current_match and match_conf >= current_step.completion_rule.min_confidence and not evidence.vlm_uncertain:
+                self._vlm_consistent_sample_count += 1
+            else:
+                self._vlm_consistent_sample_count = max(0, self._vlm_consistent_sample_count - 1)
+
         req_frames = max(1, current_step.completion_rule.stable_frames)
         req_hold = current_step.completion_rule.hold_seconds
 
-        if current_match and match_conf >= current_step.completion_rule.min_confidence:
+        # Check conditions
+        vlm_sample_ok = True
+        if current_step.completion_rule.rule_type in ("vlm_state_tracking", "vlm_confirmation"):
+            vlm_sample_ok = (self._vlm_consistent_sample_count >= req_vlm_samples)
+
+        if current_match and match_conf >= current_step.completion_rule.min_confidence and not evidence.vlm_uncertain:
             if self._consecutive_match_frames == 0:
                 self._stable_start_time = now
 
@@ -270,10 +301,15 @@ class ProcedureEngine:
 
             frame_ratio = min(1.0, self._consecutive_match_frames / float(req_frames))
             hold_ratio = 1.0 if req_hold <= 0.0 else min(1.0, elapsed_hold / float(req_hold))
-            stability_ratio = min(frame_ratio, hold_ratio)
+            vlm_ratio = min(1.0, self._vlm_consistent_sample_count / float(max(1, req_vlm_samples)))
 
-            # Check if completion condition satisfied
-            if self._consecutive_match_frames >= req_frames and elapsed_hold >= req_hold:
+            if current_step.completion_rule.rule_type in ("vlm_state_tracking", "vlm_confirmation"):
+                stability_ratio = min(frame_ratio, hold_ratio, vlm_ratio)
+            else:
+                stability_ratio = min(frame_ratio, hold_ratio)
+
+            # Check if all completion criteria satisfied
+            if vlm_sample_ok and self._consecutive_match_frames >= req_frames and elapsed_hold >= req_hold:
                 # Step Complete!
                 completed_step_id = current_step.id
                 transition_occurred = True
@@ -282,6 +318,7 @@ class ProcedureEngine:
                 self.current_step_index += 1
                 self._consecutive_match_frames = 0
                 self._stable_start_time = None
+                self._vlm_consistent_sample_count = 0
                 self._current_step_start_time = now
 
                 if self.current_step_index >= len(self.procedure.steps):
@@ -295,24 +332,47 @@ class ProcedureEngine:
                     next_step = self.procedure.get_step_by_index(self.current_step_index + 1)
                     stability_ratio = 0.0
         else:
-            # Decay stability gracefully instead of instant cliff on single flicker
             if self._consecutive_match_frames > 0:
                 self._consecutive_match_frames = max(0, self._consecutive_match_frames - 2)
             else:
                 self._stable_start_time = None
             stability_ratio = min(1.0, self._consecutive_match_frames / float(req_frames))
 
-        # 5. Check for sequence errors (Skipped steps & Repeated steps)
+        # 5. Temporal Sequence Anomaly Checks
         if not transition_occurred and self.state != EngineState.COMPLETED:
-            # Check skipped steps (look-ahead into future steps k+1, k+2, etc.)
+            # Check Out-of-Order / Early Stowage Anomaly:
+            # If on step 1 (locate) or step 2 (open), but notebook is already closed in stowed_area:
+            v_loc = evidence.vlm_state.get("location", "")
+            v_state = evidence.vlm_state.get("open_or_closed", "")
+            if current_step.order in (1, 2) and v_loc == "stowed_area" and v_state == "closed":
+                cnt = self._future_step_match_counters.get("stowed_early", 0) + 1
+                self._future_step_match_counters["stowed_early"] = cnt
+                if cnt >= 4:
+                    warn = WarningEvent(
+                        warning_type=WarningType.OUT_OF_ORDER,
+                        message=(
+                            f"Sequence anomaly: {self.target_object.capitalize()} observed in stowed area "
+                            f"before completing open/close verification sequence!"
+                        ),
+                        step_id=current_step.id,
+                        timestamp=now,
+                        details={"location": v_loc, "open_or_closed": v_state}
+                    )
+                    self._emit_warning(warn)
+                    recent_warning = warn
+                    self.state = EngineState.NEEDS_ATTENTION
+                    self._future_step_match_counters["stowed_early"] = 0
+            else:
+                self._future_step_match_counters["stowed_early"] = 0
+
+            # Check skipped steps across procedure
             for future_idx in range(self.current_step_index + 1, len(self.procedure.steps)):
                 future_step = self.procedure.steps[future_idx]
                 f_match, f_conf, _, _ = self._evaluate_step_evidence(future_step, evidence)
-                if f_match and f_conf >= 0.70:
+                if f_match and f_conf >= future_step.completion_rule.min_confidence:
                     cnt = self._future_step_match_counters.get(future_step.id, 0) + 1
                     self._future_step_match_counters[future_step.id] = cnt
-                    # If future step observed consistently for 6+ frames while current incomplete:
-                    if cnt >= 6:
+                    if cnt >= 5:
                         warn = WarningEvent(
                             warning_type=WarningType.SKIPPED_STEP,
                             message=(
@@ -320,7 +380,7 @@ class ProcedureEngine:
                                 f"('{future_step.name}') while current Step {current_step.order} "
                                 f"('{current_step.name}') is incomplete!"
                             ),
-                            step_id=current_step.id,
+                            step_id=future_step.id,
                             timestamp=now,
                             details={"future_step_id": future_step.id, "confidence": f_conf}
                         )
@@ -328,36 +388,9 @@ class ProcedureEngine:
                         recent_warning = warn
                         self.state = EngineState.NEEDS_ATTENTION
                         self._future_step_match_counters[future_step.id] = 0
+                        break
                 else:
-                    self._future_step_match_counters[future_step.id] = 0
-
-            # Check repeated / out-of-order steps (look-behind into already completed steps)
-            for past_idx in range(0, self.current_step_index):
-                past_step = self.procedure.steps[past_idx]
-                p_match, p_conf, _, _ = self._evaluate_step_evidence(past_step, evidence)
-                # Avoid flagging if current step has overlapping colors
-                overlapping_colors = set(current_step.expected_evidence.required_colors) & set(
-                    past_step.expected_evidence.required_colors
-                )
-                if p_match and p_conf >= 0.75 and not overlapping_colors:
-                    cnt = self._past_step_match_counters.get(past_step.id, 0) + 1
-                    self._past_step_match_counters[past_step.id] = cnt
-                    if cnt >= 8:
-                        warn = WarningEvent(
-                            warning_type=WarningType.REPEATED_STEP,
-                            message=(
-                                f"Repeated action alert: Evidence matches already-completed Step {past_step.order} "
-                                f"('{past_step.name}')."
-                            ),
-                            step_id=current_step.id,
-                            timestamp=now,
-                            details={"past_step_id": past_step.id}
-                        )
-                        self._emit_warning(warn)
-                        recent_warning = warn
-                        self._past_step_match_counters[past_step.id] = 0
-                else:
-                    self._past_step_match_counters[past_step.id] = 0
+                    self._future_step_match_counters[future_step.id] = max(0, self._future_step_match_counters.get(future_step.id, 0) - 1)
 
         # Progress calculation
         completed_count = sum(1 for r in self.step_records if r.status == StepStatus.COMPLETED)
@@ -376,6 +409,8 @@ class ProcedureEngine:
             evidence_source=evidence_source,
             transition_occurred=transition_occurred,
             completed_step_id=completed_step_id,
+            vlm_sample_count=self._vlm_consistent_sample_count,
+            required_vlm_samples=req_vlm_samples,
         )
 
     def _evaluate_step_evidence(
@@ -385,80 +420,96 @@ class ProcedureEngine:
     ) -> Tuple[bool, float, str, str]:
         """Evaluates whether frame evidence satisfies a step's requirements."""
         exp = step.expected_evidence
-        matched_colors: List[str] = []
-        matched_objects: List[str] = []
         confidences: List[float] = []
         source = "deterministic_rules"
-
-        # Check required colors and target ROI
-        for req_color in exp.required_colors:
-            color_matches = [
-                d for d in evidence.detections
-                if d.source == "color_roi" and d.name == req_color
-            ]
-            if exp.roi:
-                color_matches = [d for d in color_matches if d.roi == exp.roi]
-
-            if color_matches:
-                best = max(color_matches, key=lambda d: d.confidence)
-                matched_colors.append(req_color)
-                confidences.append(best.confidence)
-
-        # Check required objects (from YOLO or other object detectors)
-        for req_obj in exp.required_objects:
-            obj_matches = [
-                d for d in evidence.detections
-                if d.source in ("yolo", "detector") and d.name.lower() == req_obj.lower()
-            ]
-            if exp.roi:
-                obj_matches = [d for d in obj_matches if d.roi == exp.roi]
-
-            if obj_matches:
-                best = max(obj_matches, key=lambda d: d.confidence)
-                matched_objects.append(req_obj)
-                confidences.append(best.confidence)
-
-        # Check VLM hints if available
-        vlm_support = False
-        if exp.vlm_keywords and evidence.vlm_summary:
-            vlm_text = evidence.vlm_summary.lower()
-            if any(k.lower() in vlm_text for k in exp.vlm_keywords):
-                vlm_support = True
-                source = "hybrid"
-                if evidence.vlm_confidence:
-                    confidences.append(evidence.vlm_confidence)
-
-        # Determine satisfaction
-        colors_ok = (len(matched_colors) == len(exp.required_colors))
-        objects_ok = (len(matched_objects) == len(exp.required_objects))
+        desc_parts: List[str] = []
 
         is_match = False
         rule_type = step.completion_rule.rule_type
 
-        if rule_type == "stable_detection":
-            is_match = colors_ok and objects_ok
-        elif rule_type == "vlm_confirmation":
-            is_match = vlm_support and colors_ok
+        # 1. Evaluate VLM State Tracking (primary method for generic objects)
+        if exp.expected_state or rule_type in ("vlm_state_tracking", "vlm_confirmation"):
             source = "vlm_ollama"
-        elif rule_type == "hybrid":
-            is_match = colors_ok and (objects_ok or vlm_support)
-            source = "hybrid"
-        else:
-            is_match = colors_ok and objects_ok
+            v_state = evidence.vlm_state
+            state_match = True
 
-        avg_conf = (sum(confidences) / len(confidences)) if confidences else (0.0 if not is_match else 0.8)
+            # Target object visible check
+            if exp.expected_state.get("object_visible", True):
+                if not v_state.get("object_visible", False):
+                    state_match = False
+                else:
+                    desc_parts.append(f"{self.target_object.capitalize()} visible")
 
-        desc_parts = []
-        if matched_colors:
-            roi_str = f" in {exp.roi}" if exp.roi else ""
-            desc_parts.append(f"Colors: {', '.join(matched_colors)}{roi_str}")
-        if matched_objects:
-            desc_parts.append(f"Objects: {', '.join(matched_objects)}")
-        if vlm_support:
-            desc_parts.append("VLM confirmed keywords")
+            # Open vs closed state check
+            expected_oc = exp.expected_state.get("open_or_closed")
+            if expected_oc:
+                actual_oc = v_state.get("open_or_closed", "unknown")
+                if actual_oc.lower() != expected_oc.lower():
+                    state_match = False
+                else:
+                    desc_parts.append(f"State: {actual_oc}")
 
-        desc = " | ".join(desc_parts) if desc_parts else "Awaiting expected evidence..."
-        return is_match, avg_conf, desc, source
+            # Location / ROI check
+            expected_loc = exp.expected_state.get("location")
+            if expected_loc:
+                actual_loc = v_state.get("location", "unknown")
+                if actual_loc.lower() != expected_loc.lower():
+                    state_match = False
+                else:
+                    desc_parts.append(f"Location: {actual_loc}")
+
+            # Keyword support
+            if exp.vlm_keywords and evidence.vlm_summary:
+                txt = evidence.vlm_summary.lower()
+                if any(kw.lower() in txt for kw in exp.vlm_keywords):
+                    desc_parts.append("Keywords matched")
+
+            if evidence.vlm_confidence is not None:
+                confidences.append(evidence.vlm_confidence)
+
+            if evidence.vlm_uncertain:
+                state_match = False
+
+            is_match = state_match
+
+        # 2. Supporting ROI containment / Color / Object checks
+        if exp.required_colors or exp.roi or exp.required_objects:
+            matched_colors = []
+            for req_color in exp.required_colors:
+                matches = [d for d in evidence.detections if d.source == "color_roi" and d.name == req_color]
+                if exp.roi:
+                    matches = [d for d in matches if d.roi == exp.roi]
+                if matches:
+                    matched_colors.append(req_color)
+                    confidences.append(max(d.confidence for d in matches))
+
+            matched_objects = []
+            for req_obj in exp.required_objects:
+                matches = [d for d in evidence.detections if d.source in ("yolo", "detector") and d.name.lower() == req_obj.lower()]
+                if exp.roi:
+                    matches = [d for d in matches if d.roi == exp.roi]
+                if matches:
+                    matched_objects.append(req_obj)
+                    confidences.append(max(d.confidence for d in matches))
+
+            colors_ok = (len(matched_colors) == len(exp.required_colors)) if exp.required_colors else True
+            objects_ok = (len(matched_objects) == len(exp.required_objects)) if exp.required_objects else True
+
+            if matched_colors:
+                desc_parts.append(f"Colors: {', '.join(matched_colors)}")
+            if matched_objects:
+                desc_parts.append(f"Objects: {', '.join(matched_objects)}")
+
+            if rule_type == "stable_detection":
+                is_match = colors_ok and objects_ok
+                source = "color_roi" if matched_colors else "detector"
+            elif rule_type == "hybrid":
+                is_match = is_match and colors_ok and objects_ok
+                source = "hybrid"
+
+        avg_conf = (sum(confidences) / len(confidences)) if confidences else (0.80 if is_match else 0.0)
+        desc = " | ".join(desc_parts) if desc_parts else "Awaiting expected physical evidence..."
+        return is_match, round(avg_conf, 2), desc, source
 
     def _complete_current_step(self, timestamp: float, evidence_source: str, confidence: float) -> None:
         """Records completion for the current active step and fires listeners."""
@@ -491,6 +542,26 @@ class ProcedureEngine:
             except Exception:
                 pass
 
+    def confirm_current_step(self, reason: str = "operator_confirmed") -> bool:
+        """Operator explicitly verifies and confirms the current step."""
+        return self.advance_step(reason=reason)
+
+    def flag_uncertain_step(self, reason: str = "operator_flagged_uncertain") -> bool:
+        """Operator flags current observation as ambiguous or inconclusive."""
+        if self.state == EngineState.IDLE or self.current_step_index >= len(self.procedure.steps):
+            return False
+
+        curr_step = self.procedure.steps[self.current_step_index]
+        warn = WarningEvent(
+            warning_type=WarningType.UNCERTAIN_EVIDENCE,
+            message=f"Operator flagged Step '{curr_step.name}' as ambiguous ({reason}).",
+            step_id=curr_step.id,
+            timestamp=time.time()
+        )
+        self._emit_warning(warn)
+        self.state = EngineState.UNCERTAIN
+        return True
+
     def advance_step(self, reason: str = "operator_override") -> bool:
         """Manually advances to the next step via operator override."""
         if self.state == EngineState.IDLE or self.current_step_index >= len(self.procedure.steps):
@@ -502,7 +573,7 @@ class ProcedureEngine:
 
         warn = WarningEvent(
             warning_type=WarningType.OPERATOR_OVERRIDE,
-            message=f"Operator manually advanced step '{curr_step.name}' ({reason}).",
+            message=f"Operator manually advanced Step '{curr_step.name}' ({reason}).",
             step_id=curr_step.id,
             timestamp=now
         )
@@ -511,6 +582,7 @@ class ProcedureEngine:
         self.current_step_index += 1
         self._consecutive_match_frames = 0
         self._stable_start_time = None
+        self._vlm_consistent_sample_count = 0
         self._current_step_start_time = now
 
         if self.current_step_index >= len(self.procedure.steps):
@@ -528,7 +600,6 @@ class ProcedureEngine:
             return False
 
         now = time.time()
-        # Reset current step
         if self.current_step_index < len(self.step_records):
             self.step_records[self.current_step_index].status = StepStatus.PENDING
             self.step_records[self.current_step_index].start_time = None
@@ -542,6 +613,7 @@ class ProcedureEngine:
         self.state = EngineState.IN_PROGRESS
         self._consecutive_match_frames = 0
         self._stable_start_time = None
+        self._vlm_consistent_sample_count = 0
         self._current_step_start_time = now
 
         warn = WarningEvent(

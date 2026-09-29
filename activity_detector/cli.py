@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory for session logs and video recordings.",
     )
+    parser.add_argument(
+        "--target-object",
+        type=str,
+        default=None,
+        help="Target object name (e.g. 'notebook', 'sample container').",
+    )
     return parser
 
 
@@ -234,6 +240,9 @@ def main() -> int:
     # Load and validate procedure
     try:
         procedure = load_procedure(config.procedure_file)
+        if args.target_object:
+            procedure.target_object = args.target_object
+            config.target_object = args.target_object
     except Exception as e:
         print(f"Error loading procedure '{config.procedure_file}': {e}", file=sys.stderr)
         return 1

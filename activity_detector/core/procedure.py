@@ -11,21 +11,29 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class ExpectedEvidence(BaseModel):
     """Specification of observable evidence expected for a step."""
+    target_object: Optional[str] = Field(
+        default=None,
+        description="Target object name (e.g. 'notebook', 'sample container')."
+    )
+    expected_state: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Expected object physical state: {'object_visible': True, 'open_or_closed': 'open', 'location': 'workspace_center'}."
+    )
     required_colors: List[str] = Field(
         default_factory=list,
-        description="Deterministic color keys (e.g. ['blue_reagent', 'yellow_flask'])."
+        description="Optional supporting color keys (e.g. ['blue_reagent', 'yellow_flask'])."
     )
     required_objects: List[str] = Field(
         default_factory=list,
-        description="Object class names detected by YOLO or color tags."
+        description="Object class names detected by YOLO or detector tags."
     )
     roi: Optional[str] = Field(
         default=None,
-        description="Target ROI key (e.g. 'workbench_center', 'staging_left')."
+        description="Target ROI key (e.g. 'workspace_center', 'stowed_area')."
     )
     vlm_keywords: List[str] = Field(
         default_factory=list,
-        description="Keywords expected in VLM narrative analysis (e.g. ['pipette', 'transferring'])."
+        description="Keywords expected in VLM narrative analysis (e.g. ['open', 'pages', 'closed'])."
     )
 
 
@@ -33,7 +41,13 @@ class CompletionRule(BaseModel):
     """Conditions under which a step is declared completed."""
     rule_type: str = Field(
         default="stable_detection",
-        description="One of: 'stable_detection', 'vlm_confirmation', 'duration_hold', 'hybrid'"
+        description="One of: 'vlm_state_tracking', 'stable_detection', 'vlm_confirmation', 'duration_hold', 'hybrid'"
+    )
+    min_vlm_samples: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        description="Minimum separate VLM observation samples required across time to confirm step."
     )
     stable_frames: int = Field(
         default=8,
@@ -57,7 +71,7 @@ class CompletionRule(BaseModel):
 
 class StepDefinition(BaseModel):
     """Specification for an individual experiment step."""
-    id: str = Field(..., description="Unique step identifier, e.g. 'step_1_safety'")
+    id: str = Field(..., description="Unique step identifier, e.g. 'step_1_locate_notebook'")
     order: int = Field(..., ge=1, description="1-based sequence order")
     name: str = Field(..., min_length=2, description="Short human-readable step name")
     instruction: str = Field(..., min_length=5, description="Clear, detailed guidance for the operator")
@@ -78,7 +92,8 @@ class Procedure(BaseModel):
     title: str = Field(..., min_length=3)
     version: str = Field(default="1.0.0")
     description: str = Field(default="")
-    author: str = Field(default="Lab Operations")
+    author: str = Field(default="Tabletop Procedure Monitoring Prototype")
+    target_object: str = Field(default="notebook", description="Default user-selected target object")
     steps: List[StepDefinition] = Field(..., min_length=1)
 
     @model_validator(mode="after")

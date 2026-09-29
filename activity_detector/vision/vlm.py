@@ -1,4 +1,4 @@
-"""Local Vision-Language Model (VLM) client supporting Ollama with strict JSON parsing."""
+"""Local Vision-Language Model (VLM) client for generic object inspection via Ollama."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from queue import Empty, Queue
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from pydantic import BaseModel, Field, ValidationError
@@ -31,32 +31,52 @@ class VlmHealthStatus(BaseModel):
 
 
 class VlmResponseSchema(BaseModel):
-    """Strict JSON schema required from the VLM."""
-    step_recognized: bool = Field(
+    """Strict, validated JSON schema for generic object visual evidence."""
+    object_visible: bool = Field(
         default=False,
-        description="Whether the expected action/step was observed in the image."
+        description="Whether the specified target object (e.g. notebook) is clearly visible in the image."
     )
-    action_description: str = Field(
-        default="No action described",
-        description="Concise description of the operator's current action."
+    object_description: str = Field(
+        default="",
+        description="Visual description of the target object (color, cover texture, appearance)."
     )
-    detected_items: List[str] = Field(
-        default_factory=list,
-        description="Items, containers, or tools visible in the frame."
+    open_or_closed: str = Field(
+        default="unknown",
+        description="'open' if pages/interior are visible, 'closed' if covers are shut, or 'unknown'."
+    )
+    held_or_on_surface: str = Field(
+        default="unknown",
+        description="'held' if held by hand, 'on_surface' if resting on table/mat, or 'unknown'."
+    )
+    location: str = Field(
+        default="unknown",
+        description="Approximate position: 'workspace_center', 'stowed_area', 'prep_left', or 'unknown'."
     )
     confidence: float = Field(
-        default=0.5,
+        default=0.0,
         ge=0.0,
         le=1.0,
-        description="Self-reported confidence score between 0.0 and 1.0."
+        description="Confidence score for this visual observation (0.0 to 1.0)."
     )
     is_uncertain: bool = Field(
         default=False,
-        description="Set to true if image is ambiguous, occluded, or inconclusive."
+        description="True if image is blurry, partially out of frame, ambiguous, or lighting is poor."
     )
     reasoning: str = Field(
         default="",
-        description="Brief physical evidence justifying the conclusion."
+        description="Concise physical evidence explaining the classification."
+    )
+    step_recognized: Optional[bool] = Field(
+        default=None,
+        description="Optional alias/legacy flag indicating if step criteria was met."
+    )
+    action_description: Optional[str] = Field(
+        default=None,
+        description="Optional legacy description of action observed."
+    )
+    detected_items: List[str] = Field(
+        default_factory=list,
+        description="Optional detected item labels."
     )
 
 
@@ -64,8 +84,9 @@ class VlmInterpretation(BaseModel):
     """Audited result of a single sampled frame analysis."""
     timestamp: float = Field(default_factory=time.time)
     schema_data: VlmResponseSchema
-    raw_text: str
-    model_name: str
+    target_object: str = "notebook"
+    raw_text: str = ""
+    model_name: str = ""
     is_valid: bool = True
     latency_seconds: float = 0.0
 
@@ -77,9 +98,10 @@ class BaseVlmClient(ABC):
     def submit_sample(
         self,
         frame: np.ndarray,
+        target_object: str,
         step_name: str,
         step_instruction: str,
-        expected_items: List[str],
+        expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Submits a sampled frame for background analysis."""
         pass
@@ -122,9 +144,10 @@ class OllamaVlmClient(BaseVlmClient):
     def submit_sample(
         self,
         frame: np.ndarray,
+        target_object: str,
         step_name: str,
         step_instruction: str,
-        expected_items: List[str],
+        expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Pushes a sampled frame to the background queue if interval has elapsed."""
         if not self.config.enabled or frame is None:
@@ -151,9 +174,10 @@ class OllamaVlmClient(BaseVlmClient):
         try:
             self._queue.put_nowait({
                 "frame": resized,
+                "target_object": target_object,
                 "step_name": step_name,
                 "step_instruction": step_instruction,
-                "expected_items": expected_items,
+                "expected_state": expected_state or {},
                 "timestamp": now,
             })
             return True
@@ -189,9 +213,10 @@ class OllamaVlmClient(BaseVlmClient):
             t0 = time.time()
             interp = self._query_ollama(
                 frame=item["frame"],
+                target_object=item["target_object"],
                 step_name=item["step_name"],
                 step_instruction=item["step_instruction"],
-                expected_items=item["expected_items"]
+                expected_state=item["expected_state"],
             )
             interp.latency_seconds = round(time.time() - t0, 2)
 
@@ -201,9 +226,10 @@ class OllamaVlmClient(BaseVlmClient):
     def _query_ollama(
         self,
         frame: np.ndarray,
+        target_object: str,
         step_name: str,
         step_instruction: str,
-        expected_items: List[str],
+        expected_state: Dict[str, Any],
     ) -> VlmInterpretation:
         """Sends single frame and strict JSON prompt to Ollama."""
         try:
@@ -212,16 +238,25 @@ class OllamaVlmClient(BaseVlmClient):
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             b64_img = base64.b64encode(buf).decode("utf-8")
 
-            items_str = ", ".join(expected_items) if expected_items else "reagents, tools, containers"
             prompt = (
-                f"You are an offline laboratory activity monitor. Analyze this webcam image for:\n"
-                f"Step: {step_name}\n"
-                f"Instruction: {step_instruction}\n"
-                f"Expected items: {items_str}\n\n"
-                f"Reply ONLY in valid JSON matching this schema exactly:\n"
-                f'{{"step_recognized": true, "action_description": "...", "detected_items": ["..."], '
-                f'"confidence": 0.85, "is_uncertain": false, "reasoning": "..."}}\n'
-                f"If the image is blurry, occluded, or inconclusive, set is_uncertain to true."
+                f"You are an offline lab vision assistant inspecting tabletop procedure execution.\n"
+                f"Target object to inspect: '{target_object}'\n"
+                f"Active step: '{step_name}'\n"
+                f"Current instruction: '{step_instruction}'\n\n"
+                f"Carefully inspect the image for visible physical evidence only. Do NOT speculate or guess operator intent.\n"
+                f"Report the visible physical state of the '{target_object}'.\n"
+                f"Respond ONLY in valid JSON matching this schema exactly:\n"
+                f'{{\n'
+                f'  "object_visible": true,\n'
+                f'  "object_description": "visual appearance of the {target_object}",\n'
+                f'  "open_or_closed": "open" | "closed" | "unknown",\n'
+                f'  "held_or_on_surface": "held" | "on_surface" | "unknown",\n'
+                f'  "location": "workspace_center" | "stowed_area" | "prep_left" | "unknown",\n'
+                f'  "confidence": 0.85,\n'
+                f'  "is_uncertain": false,\n'
+                f'  "reasoning": "physical evidence observed"\n'
+                f'}}\n\n'
+                f"If the image is blurry, occluded, or inconclusive, set \"is_uncertain\": true."
             )
 
             client = ollama.Client(host=self.config.host)
@@ -246,6 +281,7 @@ class OllamaVlmClient(BaseVlmClient):
             return VlmInterpretation(
                 timestamp=time.time(),
                 schema_data=schema_data,
+                target_object=target_object,
                 raw_text=raw_content,
                 model_name=self._active_model,
                 is_valid=is_valid,
@@ -253,11 +289,12 @@ class OllamaVlmClient(BaseVlmClient):
 
         except Exception as e:
             logger.warning(f"Ollama inference error with {self._active_model}: {e}")
-            # Return safe uncertain fallback
             fallback_schema = VlmResponseSchema(
-                step_recognized=False,
-                action_description=f"Inference error: {type(e).__name__}",
-                detected_items=[],
+                object_visible=False,
+                object_description=f"Inference error: {type(e).__name__}",
+                open_or_closed="unknown",
+                held_or_on_surface="unknown",
+                location="unknown",
                 confidence=0.0,
                 is_uncertain=True,
                 reasoning=str(e),
@@ -265,6 +302,7 @@ class OllamaVlmClient(BaseVlmClient):
             return VlmInterpretation(
                 timestamp=time.time(),
                 schema_data=fallback_schema,
+                target_object=target_object,
                 raw_text=str(e),
                 model_name=self._active_model,
                 is_valid=False,
@@ -288,22 +326,33 @@ class OllamaVlmClient(BaseVlmClient):
 
         try:
             parsed = json.loads(cleaned)
+            # Normalize fields if legacy keys present
+            if "step_recognized" in parsed and "object_visible" not in parsed:
+                parsed["object_visible"] = parsed["step_recognized"]
+            if "action_description" in parsed and "object_description" not in parsed:
+                parsed["object_description"] = parsed["action_description"]
+
             schema = VlmResponseSchema.model_validate(parsed)
+            # Low confidence must be treated as uncertain
+            if schema.confidence < 0.40:
+                schema.is_uncertain = True
+
             return schema, True
         except (json.JSONDecodeError, ValidationError) as err:
             logger.debug(f"Failed to parse VLM JSON: {err}. Raw text: {text[:120]}")
-            # Return uncertain fallback
             return VlmResponseSchema(
-                step_recognized=False,
-                action_description="Output format invalid; flagged for operator review",
-                detected_items=[],
+                object_visible=False,
+                object_description="Output format invalid; flagged for operator review",
+                open_or_closed="unknown",
+                held_or_on_surface="unknown",
+                location="unknown",
                 confidence=0.0,
                 is_uncertain=True,
                 reasoning="VLM produced unparseable JSON",
             ), False
 
     def check_health(self) -> VlmHealthStatus:
-        """Tests connection to local Ollama server and lists installed vision models."""
+        """Tests connection to local Ollama server and checks installed vision models."""
         try:
             import ollama  # type: ignore
             client = ollama.Client(host=self.config.host)
@@ -320,10 +369,10 @@ class OllamaVlmClient(BaseVlmClient):
 
             if has_primary:
                 self._active_model = self.config.model
-                msg = f"Ollama online. Primary model '{self.config.model}' is available."
+                msg = f"Ollama online. Primary vision model '{self.config.model}' is available."
             elif has_alt:
                 self._active_model = self.config.alternative_model
-                msg = f"Primary model missing; using alternative '{self.config.alternative_model}'."
+                msg = f"Primary model missing; using installed alternative '{self.config.alternative_model}'."
             else:
                 msg = f"Ollama online, but neither '{self.config.model}' nor '{self.config.alternative_model}' was found."
 
@@ -349,33 +398,50 @@ class OllamaVlmClient(BaseVlmClient):
 class MockVlmClient(BaseVlmClient):
     """Deterministic mock VLM client for unit testing and offline development."""
 
-    def __init__(self, mock_step_recognized: bool = True, mock_confidence: float = 0.85) -> None:
-        self.mock_step_recognized = mock_step_recognized
+    def __init__(
+        self,
+        mock_object_visible: bool = True,
+        mock_open_closed: str = "closed",
+        mock_location: str = "workspace_center",
+        mock_confidence: float = 0.85,
+        mock_uncertain: bool = False,
+        mock_step_recognized: Optional[bool] = None,
+    ) -> None:
+        self.mock_object_visible = mock_object_visible
+        self.mock_open_closed = mock_open_closed
+        self.mock_location = mock_location
         self.mock_confidence = mock_confidence
+        self.mock_uncertain = mock_uncertain
+        self.mock_step_recognized = mock_step_recognized
         self._latest: Optional[VlmInterpretation] = None
 
     def submit_sample(
         self,
         frame: np.ndarray,
+        target_object: str,
         step_name: str,
         step_instruction: str,
-        expected_items: List[str],
+        expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
         schema = VlmResponseSchema(
-            step_recognized=self.mock_step_recognized,
-            action_description=f"Mock detected action for {step_name}",
-            detected_items=expected_items,
+            object_visible=self.mock_object_visible,
+            object_description=f"Mock description of {target_object}",
+            open_or_closed=self.mock_open_closed,
+            held_or_on_surface="on_surface",
+            location=self.mock_location,
             confidence=self.mock_confidence,
-            is_uncertain=False,
-            reasoning="Mock verification",
+            is_uncertain=self.mock_uncertain,
+            reasoning="Mock verification evidence",
+            step_recognized=self.mock_step_recognized,
         )
         self._latest = VlmInterpretation(
             timestamp=time.time(),
             schema_data=schema,
+            target_object=target_object,
             raw_text='{"mock": true}',
             model_name="mock-vlm",
             is_valid=True,
-            latency_seconds=0.05,
+            latency_seconds=0.02,
         )
         return True
 

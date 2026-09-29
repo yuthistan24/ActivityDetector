@@ -41,8 +41,15 @@ class CameraManager:
         if self._running:
             return True
 
-        self._cap = cv2.VideoCapture(self.source)
-        if not self._cap.isOpened():
+        if isinstance(self.source, int):
+            # Prefer DirectShow on Windows to avoid MSMF -1072873822 errors
+            self._cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+            if not self._cap.isOpened():
+                self._cap = cv2.VideoCapture(self.source)
+        else:
+            self._cap = cv2.VideoCapture(self.source)
+
+        if not self._cap or not self._cap.isOpened():
             self.is_connected = False
             self.last_error = f"Could not open video source: '{self.source}'"
             logger.warning(self.last_error)
