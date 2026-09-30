@@ -62,22 +62,22 @@ class VisionConfig(BaseModel):
 
 
 class YoloConfig(BaseModel):
-    """Optional local YOLO detector settings."""
-    enabled: bool = Field(default=False)
-    model_path: str = Field(default="")
-    confidence_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    """Primary YOLO detector settings (YOLO11n / YOLOv8n COCO)."""
+    enabled: bool = Field(default=True)
+    model_path: str = Field(default="yolo11n.pt")
+    confidence_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
 
 
 class VlmConfig(BaseModel):
     """Local Vision-Language Model configuration (Ollama)."""
     enabled: bool = Field(default=True)
     provider: str = Field(default="ollama")
-    model: str = Field(default="qwen3.5:latest")
-    alternative_model: str = Field(default="gemma4:e4b-it-qat")
+    model: str = Field(default="gemma4:latest")
+    alternative_model: str = Field(default="")
     host: str = Field(default="http://localhost:11434")
-    sample_interval_seconds: float = Field(default=4.0, ge=0.1, le=60.0)
-    num_ctx: int = Field(default=2048, ge=512, le=32768)
-    num_gpu: int = Field(default=0, ge=0, le=64, description="0 offloads compute buffers to CPU to prevent CUDA OOM on laptop GPUs")
+    sample_interval_seconds: float = Field(default=3.0, ge=0.1, le=60.0)
+    num_ctx: int = Field(default=1024, ge=256, le=32768)
+    num_gpu: Optional[int] = Field(default=None, description="None allows Ollama auto GPU detection; 0 forces CPU")
     timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
     image_max_dimension: int = Field(default=480, ge=240, le=1280)
     jpeg_quality: int = Field(default=75, ge=40, le=95)
@@ -113,8 +113,8 @@ class StreamingConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """Master application configuration."""
-    procedure_file: str = Field(default="procedures/default_notebook_handling.yaml")
-    target_object: str = Field(default="notebook", description="Selected object to monitor")
+    procedure_file: str = Field(default="procedures/bottle_tabletop_workflow.yaml")
+    target_object: str = Field(default="bottle", description="Selected COCO class to monitor")
     camera: CameraConfig = Field(default_factory=CameraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     yolo: YoloConfig = Field(default_factory=YoloConfig)
@@ -125,37 +125,35 @@ class AppConfig(BaseModel):
 
 
 def get_default_config() -> AppConfig:
-    """Returns standard default configuration with generic object handling settings."""
+    """Returns default configuration for water bottle tabletop demo (YOLO11n)."""
     return AppConfig(
-        procedure_file="procedures/default_notebook_handling.yaml",
-        target_object="notebook",
+        procedure_file="procedures/bottle_tabletop_workflow.yaml",
+        target_object="bottle",
         camera=CameraConfig(source=0, width=1280, height=720, fps=30),
         vision=VisionConfig(
             min_contour_area=700,
             rois={
-                "workspace_center": RoiRule(x1=0.20, y1=0.20, x2=0.70, y2=0.85),
-                "stowed_area": RoiRule(x1=0.72, y1=0.20, x2=0.98, y2=0.85),
-                "prep_left": RoiRule(x1=0.02, y1=0.20, x2=0.18, y2=0.85),
+                "prep_left":        RoiRule(x1=0.02, y1=0.15, x2=0.28, y2=0.92),
+                "workspace_center": RoiRule(x1=0.30, y1=0.15, x2=0.68, y2=0.92),
+                "stowed_area":      RoiRule(x1=0.70, y1=0.15, x2=0.98, y2=0.92),
             },
             colors={
-                # Optional supporting color cues (e.g. for color-tagged items)
-                "blue_marker": ColorRule(h_min=100, s_min=110, v_min=60, h_max=130, s_max=255, v_max=255),
+                # HSV colour cues are supporting evidence only.
                 "yellow_cover": ColorRule(h_min=18, s_min=100, v_min=100, h_max=35, s_max=255, v_max=255),
-                "red_tag": ColorRule(h_min=0, s_min=120, v_min=70, h_max=10, s_max=255, v_max=255),
-                "green_mat": ColorRule(h_min=38, s_min=80, v_min=50, h_max=85, s_max=255, v_max=255),
+                "blue_marker":  ColorRule(h_min=100, s_min=110, v_min=60, h_max=130, s_max=255, v_max=255),
             }
         ),
-        yolo=YoloConfig(enabled=False, model_path="", confidence_threshold=0.45),
+        yolo=YoloConfig(enabled=True, model_path="yolo11n.pt", confidence_threshold=0.40),
         vlm=VlmConfig(
-            enabled=True,
+            enabled=False,
             provider="ollama",
-            model="qwen3.5:latest",
-            alternative_model="gemma4:e4b-it-qat",
+            model="gemma4:latest",
+            alternative_model="",
             host="http://localhost:11434",
-            sample_interval_seconds=4.0,
-            num_ctx=2048,
-            num_gpu=0,
-            timeout_seconds=12.0
+            sample_interval_seconds=5.0,
+            num_ctx=1024,
+            num_gpu=None,
+            timeout_seconds=15.0,
         ),
         audio=AudioConfig(
             enabled=True,

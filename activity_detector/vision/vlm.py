@@ -144,6 +144,39 @@ class BaseVlmClient(ABC):
         """Human-readable reason for degradation if degraded."""
         return ""
 
+    @property
+    def target_object(self) -> str:
+        """Returns the active target object."""
+        return getattr(self, "_target_object", "notebook")
+
+    def set_target_object(self, target_object: str) -> None:
+        """Updates the active target object to monitor and clears stale observations."""
+        pass
+
+    def set_sample_interval(self, seconds: float) -> None:
+        """Updates the frame sampling interval in seconds."""
+        pass
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Returns live inference status and timing telemetry."""
+        return {
+            "state": "waiting",
+            "is_analyzing": False,
+            "analyzing_duration": 0.0,
+            "target_object": "notebook",
+            "active_model": "",
+            "last_observation": None,
+            "last_observation_age": None,
+            "last_success_time": 0.0,
+            "last_success_age": None,
+            "last_success_interpretation": None,
+            "last_error": "",
+            "sample_interval": 3.0,
+            "is_degraded": False,
+            "degraded_reason": "",
+            "is_paused": False,
+        }
+
 
 class OllamaVlmClient(BaseVlmClient):
     """Threaded Ollama vision client with rate limiting and strict schema validation."""
@@ -163,6 +196,16 @@ class OllamaVlmClient(BaseVlmClient):
         self._cooldown_until: float = 0.0
         self._is_degraded: bool = False
         self._degraded_reason: str = ""
+
+        # Dynamic recognition state tracking
+        self._target_object: str = "notebook"
+        self._inference_state: str = "waiting"
+        self._is_analyzing: bool = False
+        self._analyzing_start_time: float = 0.0
+        self._last_success_time: float = 0.0
+        self._last_success_interpretation: Optional[VlmInterpretation] = None
+        self._last_failure_time: float = 0.0
+        self._last_error_message: str = ""
 
         self._thread = threading.Thread(
             target=self._worker_loop,
@@ -187,12 +230,62 @@ class OllamaVlmClient(BaseVlmClient):
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
+    @property
+    def inference_state(self) -> str:
+        return self._inference_state
+
+    @property
+    def target_object(self) -> str:
+        return self._target_object
+
+    def set_target_object(self, target_object: str) -> None:
+        """Updates the active target object and resets prior observations."""
+        with self._lock:
+            self._target_object = target_object.strip() or "notebook"
+            self._latest_interpretation = None
+            self._inference_state = "waiting"
+        try:
+            self._queue.get_nowait()
+        except Empty:
+            pass
+        logger.info(f"VLM target object set to '{self._target_object}', prior interpretation cleared.")
+
+    def set_sample_interval(self, seconds: float) -> None:
+        """Updates the frame sampling interval in seconds."""
+        self.config.sample_interval_seconds = max(0.1, float(seconds))
+        logger.info(f"VLM sample interval set to {self.config.sample_interval_seconds:.1f}s.")
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Returns live inference status and timing telemetry."""
+        with self._lock:
+            now = time.time()
+            last_obs = self._latest_interpretation
+            return {
+                "state": self._inference_state,
+                "is_analyzing": self._is_analyzing,
+                "analyzing_duration": (now - self._analyzing_start_time) if self._is_analyzing else 0.0,
+                "target_object": self._target_object,
+                "active_model": self._active_model,
+                "last_observation": last_obs,
+                "last_observation_age": (now - last_obs.timestamp) if last_obs else None,
+                "last_success_time": self._last_success_time,
+                "last_success_age": (now - self._last_success_time) if self._last_success_time > 0 else None,
+                "last_success_interpretation": self._last_success_interpretation,
+                "last_error": self._last_error_message,
+                "sample_interval": self.config.sample_interval_seconds,
+                "is_degraded": self._is_degraded,
+                "degraded_reason": self._degraded_reason,
+                "is_paused": self._paused,
+            }
+
     def pause(self) -> None:
         self._paused = True
         try:
             self._queue.get_nowait()
         except Empty:
             pass
+        with self._lock:
+            self._inference_state = "waiting"
         logger.info("VLM background sampling PAUSED.")
 
     def resume(self) -> None:
@@ -207,8 +300,12 @@ class OllamaVlmClient(BaseVlmClient):
         step_instruction: str,
         expected_state: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Pushes a sampled frame to the background queue if interval has elapsed."""
+        """Pushes a sampled frame to the background queue if interval has elapsed and worker is not busy."""
         if not self.config.enabled or self._paused or frame is None:
+            return False
+
+        # Prevent overlapping requests: do not queue if currently analyzing
+        if self._is_analyzing:
             return False
 
         now = time.time()
@@ -220,6 +317,7 @@ class OllamaVlmClient(BaseVlmClient):
             return False
 
         self._last_sample_time = now
+        self._target_object = target_object
 
         # Compress to configurable dimensions (default max 480px) and quality (default 75)
         h, w = frame.shape[:2]
@@ -296,6 +394,11 @@ class OllamaVlmClient(BaseVlmClient):
                 logger.info(f"Discarding outdated pending VLM sample ({queue_age:.2f}s old).")
                 continue
 
+            with self._lock:
+                self._is_analyzing = True
+                self._analyzing_start_time = time.time()
+                self._inference_state = "analyzing"
+
             t0 = time.time()
             interp = self._query_ollama(
                 b64_img=item["b64_img"],
@@ -310,7 +413,50 @@ class OllamaVlmClient(BaseVlmClient):
             interp.latency_seconds = round(time.time() - t0, 2)
 
             with self._lock:
+                self._is_analyzing = False
                 self._latest_interpretation = interp
+                if interp.is_valid:
+                    self._last_success_time = time.time()
+                    self._last_success_interpretation = interp
+                    if interp.schema_data.is_uncertain:
+                        self._inference_state = "uncertain"
+                    elif interp.schema_data.object_visible:
+                        self._inference_state = "recognized"
+                    else:
+                        self._inference_state = "not_visible"
+                else:
+                    self._inference_state = "unavailable"
+                    self._last_failure_time = time.time()
+                    self._last_error_message = interp.schema_data.reasoning
+
+    def _build_prompt(
+        self,
+        target_object: str,
+        step_name: str,
+        step_instruction: str,
+        expected_state: Dict[str, Any],
+    ) -> str:
+        """Constructs concise schema-constrained prompt for Ollama vision model."""
+        return (
+            f"You are an offline lab vision assistant inspecting tabletop procedure execution.\n"
+            f"Target object to inspect: '{target_object}'\n"
+            f"Active step: '{step_name}'\n"
+            f"Current instruction: '{step_instruction}'\n\n"
+            f"Carefully inspect the image for visible physical evidence only. Do NOT speculate or guess operator intent.\n"
+            f"Report the visible physical state of the '{target_object}'.\n"
+            f"Respond ONLY in valid JSON matching this schema exactly:\n"
+            f'{{\n'
+            f'  "object_visible": true,\n'
+            f'  "object_description": "visual appearance of the {target_object}",\n'
+            f'  "open_or_closed": "open" | "closed" | "unknown",\n'
+            f'  "held_or_on_surface": "held" | "on_surface" | "unknown",\n'
+            f'  "location": "workspace_center" | "stowed_area" | "prep_left" | "unknown",\n'
+            f'  "confidence": 0.85,\n'
+            f'  "is_uncertain": false,\n'
+            f'  "reasoning": "physical evidence observed"\n'
+            f'}}\n\n'
+            f"If the image is blurry, occluded, or inconclusive, set \"is_uncertain\": true."
+        )
 
     def _query_ollama(
         self,
@@ -328,55 +474,45 @@ class OllamaVlmClient(BaseVlmClient):
         try:
             import ollama  # type: ignore
 
-            prompt = (
-                f"You are an offline lab vision assistant inspecting tabletop procedure execution.\n"
-                f"Target object to inspect: '{target_object}'\n"
-                f"Active step: '{step_name}'\n"
-                f"Current instruction: '{step_instruction}'\n\n"
-                f"Carefully inspect the image for visible physical evidence only. Do NOT speculate or guess operator intent.\n"
-                f"Report the visible physical state of the '{target_object}'.\n"
-                f"Respond ONLY in valid JSON matching this schema exactly:\n"
-                f'{{\n'
-                f'  "object_visible": true,\n'
-                f'  "object_description": "visual appearance of the {target_object}",\n'
-                f'  "open_or_closed": "open" | "closed" | "unknown",\n'
-                f'  "held_or_on_surface": "held" | "on_surface" | "unknown",\n'
-                f'  "location": "workspace_center" | "stowed_area" | "prep_left" | "unknown",\n'
-                f'  "confidence": 0.85,\n'
-                f'  "is_uncertain": false,\n'
-                f'  "reasoning": "physical evidence observed"\n'
-                f'}}\n\n'
-                f"If the image is blurry, occluded, or inconclusive, set \"is_uncertain\": true."
-            )
+            prompt = self._build_prompt(target_object, step_name, step_instruction, expected_state)
 
             # Set explicit timeout so unresponsive daemon cannot hang worker
             client = ollama.Client(host=self.config.host, timeout=self.config.timeout_seconds)
             options = {
                 "num_ctx": self.config.num_ctx,
-                "num_gpu": self.config.num_gpu,
-                "num_predict": 60,
+                "num_predict": 160,
             }
+            if self.config.num_gpu is not None:
+                options["num_gpu"] = self.config.num_gpu
 
             logger.info(
                 f"Submitting frame to Ollama ({self._active_model}) for '{target_object}' "
                 f"(step: '{step_name}') | size: {width}x{height} ({bytes_len} bytes JPEG)..."
             )
-            resp = client.chat(
-                model=self._active_model,
-                messages=[{
+
+            chat_kwargs = {
+                "model": self._active_model,
+                "messages": [{
                     "role": "user",
                     "content": prompt,
                     "images": [b64_img],
                 }],
-                options=options,
-            )
+                "format": "json",
+                "options": options,
+            }
+            try:
+                chat_kwargs["think"] = False
+                resp = client.chat(**chat_kwargs)
+            except TypeError:
+                del chat_kwargs["think"]
+                resp = client.chat(**chat_kwargs)
 
             raw_content = resp["message"]["content"]
             schema_data, is_valid = self._parse_json_response(raw_content)
             duration = round(time.time() - t_start, 2)
             logger.info(
                 f"Ollama inference completed in {duration}s with {self._active_model} "
-                f"(valid={is_valid}, conf={schema_data.confidence:.2f})."
+                f"(valid={is_valid}, visible={schema_data.object_visible}, conf={schema_data.confidence:.2f})."
             )
 
             # Success resets failure counter and cooldown
@@ -403,12 +539,19 @@ class OllamaVlmClient(BaseVlmClient):
             self._cooldown_until = time.time() + backoff
 
             err_msg = str(e)
-            if "out-of-memory" in err_msg.lower() or "failed to allocate" in err_msg.lower():
-                short_err = "OOM: Insufficient CPU RAM for model"
+            if "out-of-memory" in err_msg.lower() or "failed to allocate" in err_msg.lower() or "cudamalloc" in err_msg.lower():
+                short_err = "OOM: Model exceeds available memory"
             elif "timed out" in err_msg.lower():
                 short_err = f"Timeout after {duration}s"
             else:
                 short_err = f"{type(e).__name__}: {err_msg[:45]}"
+
+            # Attempt automatic fallback to alternative model if current model failed
+            if self._active_model != self.config.alternative_model and self.config.alternative_model:
+                logger.warning(
+                    f"Model '{self._active_model}' failed ({short_err}). Switching active model to alternative: '{self.config.alternative_model}'."
+                )
+                self._active_model = self.config.alternative_model
 
             if self._consecutive_failures >= getattr(self.config, "max_consecutive_failures", 3):
                 self._is_degraded = True
@@ -548,6 +691,13 @@ class MockVlmClient(BaseVlmClient):
         self.submit_count: int = 0
         self._is_degraded: bool = False
         self._degraded_reason: str = ""
+        self._target_object: str = "notebook"
+        self._inference_state: str = "recognized" if (mock_object_visible and not mock_uncertain) else ("uncertain" if mock_uncertain else "not_visible")
+        self._sample_interval: float = 3.0
+        self.config = VlmConfig(enabled=True, sample_interval_seconds=self._sample_interval)
+        self._last_success_time: float = 0.0
+        self._is_analyzing: bool = False
+        self._last_error: str = ""
 
     @property
     def is_paused(self) -> bool:
@@ -560,6 +710,40 @@ class MockVlmClient(BaseVlmClient):
     @property
     def degraded_reason(self) -> str:
         return self._degraded_reason
+
+    @property
+    def target_object(self) -> str:
+        return self._target_object
+
+    def set_target_object(self, target_object: str) -> None:
+        self._target_object = target_object.strip() or "notebook"
+        self._latest = None
+        self._inference_state = "waiting"
+
+    def set_sample_interval(self, seconds: float) -> None:
+        self._sample_interval = max(0.1, float(seconds))
+        self.config.sample_interval_seconds = self._sample_interval
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        now = time.time()
+        st = "unavailable" if self._is_degraded else self._inference_state
+        return {
+            "state": st,
+            "is_analyzing": self._is_analyzing,
+            "analyzing_duration": 0.0,
+            "target_object": self._target_object,
+            "active_model": "mock-vlm",
+            "last_observation": self._latest,
+            "last_observation_age": (now - self._latest.timestamp) if self._latest else None,
+            "last_success_time": self._last_success_time,
+            "last_success_age": (now - self._last_success_time) if self._last_success_time > 0 else None,
+            "last_success_interpretation": self._latest,
+            "last_error": self._degraded_reason or self._last_error,
+            "sample_interval": self._sample_interval,
+            "is_degraded": self._is_degraded,
+            "degraded_reason": self._degraded_reason,
+            "is_paused": self._paused,
+        }
 
     def pause(self) -> None:
         self._paused = True
@@ -578,6 +762,7 @@ class MockVlmClient(BaseVlmClient):
         if self._paused:
             return False
         self.submit_count += 1
+        self._target_object = target_object
         schema = VlmResponseSchema(
             object_visible=self.mock_object_visible,
             object_description=f"Mock description of {target_object}",
@@ -589,8 +774,9 @@ class MockVlmClient(BaseVlmClient):
             reasoning="Mock verification evidence",
             step_recognized=self.mock_step_recognized,
         )
+        now = time.time()
         self._latest = VlmInterpretation(
-            timestamp=time.time(),
+            timestamp=now,
             schema_data=schema,
             target_object=target_object,
             raw_text='{"mock": true}',
@@ -598,6 +784,13 @@ class MockVlmClient(BaseVlmClient):
             is_valid=True,
             latency_seconds=0.02,
         )
+        self._last_success_time = now
+        if self.mock_uncertain:
+            self._inference_state = "uncertain"
+        elif self.mock_object_visible:
+            self._inference_state = "recognized"
+        else:
+            self._inference_state = "not_visible"
         return True
 
     def get_latest_interpretation(self) -> Optional[VlmInterpretation]:

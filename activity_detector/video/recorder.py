@@ -47,6 +47,8 @@ class VideoRecorder:
         if ext not in ("mp4", "avi"):
             ext = "mp4"
 
+        self._width = width
+        self._height = height
         fname = filename or f"session_recording_{int(time.time())}.{ext}"
         self._output_file = target_directory / fname
 
@@ -144,6 +146,8 @@ class VideoRecorder:
 
             if self._writer and self._writer.isOpened():
                 try:
+                    if hasattr(self, "_width") and (frame.shape[1], frame.shape[0]) != (self._width, self._height):
+                        frame = cv2.resize(frame, (self._width, self._height))
                     self._writer.write(frame)
                     self.frames_written += 1
                 except Exception as e:

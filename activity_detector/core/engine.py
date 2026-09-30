@@ -155,9 +155,23 @@ class ProcedureEngine:
             for step in self.procedure.steps
         ]
 
+    @property
+    def current_step(self) -> Optional[StepDefinition]:
+        """Returns the active step definition."""
+        if 0 <= self.current_step_index < len(self.procedure.steps):
+            return self.procedure.steps[self.current_step_index]
+        return None
+
     def set_target_object(self, object_name: str) -> None:
         """Updates the target object to monitor (e.g. 'notebook', 'sample container')."""
         self.target_object = object_name.strip() or "notebook"
+        for step in self.procedure.steps:
+            if hasattr(step, "expected_evidence") and step.expected_evidence:
+                step.expected_evidence.target_object = self.target_object
+        self._vlm_consistent_sample_count = 0
+        self._last_processed_vlm_sample_id = None
+        self._consecutive_match_frames = 0
+        self._stable_start_time = None
 
     def register_transition_listener(self, callback: Callable[[StepRecord], None]) -> None:
         """Adds a callback invoked when a step completes and transitions."""
@@ -418,96 +432,184 @@ class ProcedureEngine:
         step: StepDefinition,
         evidence: FrameEvidence,
     ) -> Tuple[bool, float, str, str]:
-        """Evaluates whether frame evidence satisfies a step's requirements."""
+        """Evaluates whether frame evidence satisfies a step's requirements.
+
+        Routing:
+        - ``stable_detection``           -> YOLO boxes + HSV cues only.
+          VLM is never consulted even if expected_state is populated.
+        - ``vlm_state_tracking``/``vlm_confirmation`` -> VLM primary.
+        - ``hybrid``                     -> Both VLM AND YOLO required.
+        - anything else                  -> legacy colour/ROI rules.
+        """
         exp = step.expected_evidence
         confidences: List[float] = []
-        source = "deterministic_rules"
+        source = "yolo"
         desc_parts: List[str] = []
-
         is_match = False
         rule_type = step.completion_rule.rule_type
 
-        # 1. Evaluate VLM State Tracking (primary method for generic objects)
-        if exp.expected_state or rule_type in ("vlm_state_tracking", "vlm_confirmation"):
+        # ── Path A: YOLO stable-detection ────────────────────────────
+        if rule_type == "stable_detection":
+            source = "yolo"
+
+            matched_objects = []
+            for req_obj in exp.required_objects:
+                candidates = [
+                    d for d in evidence.detections
+                    if d.source == "yolo" and d.name.lower() == req_obj.lower()
+                ]
+                if exp.roi:                        # roi=None means "any location"
+                    candidates = [d for d in candidates if d.roi == exp.roi]
+                if candidates:
+                    matched_objects.append(req_obj)
+                    best_conf = max(d.confidence for d in candidates)
+                    confidences.append(best_conf)
+                    roi_tag = f" in {exp.roi}" if exp.roi else ""
+                    desc_parts.append(f"{req_obj}{roi_tag} {int(best_conf * 100)}%")
+
+            matched_colors = []
+            for req_color in exp.required_colors:
+                cands = [
+                    d for d in evidence.detections
+                    if d.source == "color_roi" and d.name == req_color
+                ]
+                if exp.roi:
+                    cands = [d for d in cands if d.roi == exp.roi]
+                if cands:
+                    matched_colors.append(req_color)
+                    confidences.append(max(d.confidence for d in cands))
+                    desc_parts.append(f"colour:{req_color}")
+
+            objects_ok = (
+                len(matched_objects) == len(exp.required_objects)
+            ) if exp.required_objects else True
+            colors_ok = (
+                len(matched_colors) == len(exp.required_colors)
+            ) if exp.required_colors else True
+
+            # Fallback: no explicit objects/colours — match target class directly
+            if not exp.required_objects and not exp.required_colors:
+                any_hits = [
+                    d for d in evidence.detections
+                    if d.source == "yolo"
+                    and d.name.lower() == self.target_object.lower()
+                ]
+                if exp.roi:
+                    any_hits = [d for d in any_hits if d.roi == exp.roi]
+                if any_hits:
+                    objects_ok = True
+                    confidences.append(max(d.confidence for d in any_hits))
+                    desc_parts.append(f"{self.target_object} detected")
+
+            is_match = objects_ok and colors_ok
+
+        # ── Path B: VLM state-tracking ───────────────────────────────
+        elif rule_type in ("vlm_state_tracking", "vlm_confirmation"):
             source = "vlm_ollama"
             v_state = evidence.vlm_state
             state_match = True
 
-            # Target object visible check
             if exp.expected_state.get("object_visible", True):
                 if not v_state.get("object_visible", False):
                     state_match = False
                 else:
                     desc_parts.append(f"{self.target_object.capitalize()} visible")
 
-            # Open vs closed state check
             expected_oc = exp.expected_state.get("open_or_closed")
             if expected_oc:
                 actual_oc = v_state.get("open_or_closed", "unknown")
                 if actual_oc.lower() != expected_oc.lower():
                     state_match = False
                 else:
-                    desc_parts.append(f"State: {actual_oc}")
+                    desc_parts.append(f"State:{actual_oc}")
 
-            # Location / ROI check
             expected_loc = exp.expected_state.get("location")
             if expected_loc:
                 actual_loc = v_state.get("location", "unknown")
                 if actual_loc.lower() != expected_loc.lower():
                     state_match = False
                 else:
-                    desc_parts.append(f"Location: {actual_loc}")
+                    desc_parts.append(f"Loc:{actual_loc}")
 
-            # Keyword support
             if exp.vlm_keywords and evidence.vlm_summary:
                 txt = evidence.vlm_summary.lower()
                 if any(kw.lower() in txt for kw in exp.vlm_keywords):
-                    desc_parts.append("Keywords matched")
+                    desc_parts.append("keywords matched")
 
             if evidence.vlm_confidence is not None:
                 confidences.append(evidence.vlm_confidence)
-
             if evidence.vlm_uncertain:
                 state_match = False
 
+            for req_obj in exp.required_objects:
+                cands = [
+                    d for d in evidence.detections
+                    if d.source == "yolo" and d.name.lower() == req_obj.lower()
+                ]
+                if exp.roi:
+                    cands = [d for d in cands if d.roi == exp.roi]
+                if cands:
+                    confidences.append(max(d.confidence for d in cands))
+                    desc_parts.append(f"YOLO:{req_obj}")
+
             is_match = state_match
 
-        # 2. Supporting ROI containment / Color / Object checks
-        if exp.required_colors or exp.roi or exp.required_objects:
+        # ── Path C: Hybrid ───────────────────────────────────────────
+        elif rule_type == "hybrid":
+            source = "hybrid"
+            v_state = evidence.vlm_state
+            state_match = True
+            if exp.expected_state.get("object_visible", True):
+                if not v_state.get("object_visible", False):
+                    state_match = False
+            if evidence.vlm_uncertain:
+                state_match = False
+            if evidence.vlm_confidence is not None:
+                confidences.append(evidence.vlm_confidence)
+
+            yolo_ok = True
+            for req_obj in exp.required_objects:
+                cands = [
+                    d for d in evidence.detections
+                    if d.source == "yolo" and d.name.lower() == req_obj.lower()
+                ]
+                if exp.roi:
+                    cands = [d for d in cands if d.roi == exp.roi]
+                if cands:
+                    confidences.append(max(d.confidence for d in cands))
+                    desc_parts.append(f"{req_obj} detected")
+                else:
+                    yolo_ok = False
+            is_match = state_match and yolo_ok
+
+        # ── Legacy / colour-ROI rules ─────────────────────────────────
+        else:
+            source = "deterministic_rules"
             matched_colors = []
             for req_color in exp.required_colors:
-                matches = [d for d in evidence.detections if d.source == "color_roi" and d.name == req_color]
+                cands = [d for d in evidence.detections if d.source == "color_roi" and d.name == req_color]
                 if exp.roi:
-                    matches = [d for d in matches if d.roi == exp.roi]
-                if matches:
+                    cands = [d for d in cands if d.roi == exp.roi]
+                if cands:
                     matched_colors.append(req_color)
-                    confidences.append(max(d.confidence for d in matches))
-
+                    confidences.append(max(d.confidence for d in cands))
+                    desc_parts.append(f"colour:{req_color}")
             matched_objects = []
             for req_obj in exp.required_objects:
-                matches = [d for d in evidence.detections if d.source in ("yolo", "detector") and d.name.lower() == req_obj.lower()]
+                cands = [d for d in evidence.detections if d.source in ("yolo", "detector") and d.name.lower() == req_obj.lower()]
                 if exp.roi:
-                    matches = [d for d in matches if d.roi == exp.roi]
-                if matches:
+                    cands = [d for d in cands if d.roi == exp.roi]
+                if cands:
                     matched_objects.append(req_obj)
-                    confidences.append(max(d.confidence for d in matches))
-
+                    confidences.append(max(d.confidence for d in cands))
+                    desc_parts.append(f"{req_obj}")
             colors_ok = (len(matched_colors) == len(exp.required_colors)) if exp.required_colors else True
             objects_ok = (len(matched_objects) == len(exp.required_objects)) if exp.required_objects else True
+            is_match = colors_ok and objects_ok
 
-            if matched_colors:
-                desc_parts.append(f"Colors: {', '.join(matched_colors)}")
-            if matched_objects:
-                desc_parts.append(f"Objects: {', '.join(matched_objects)}")
-
-            if rule_type == "stable_detection":
-                is_match = colors_ok and objects_ok
-                source = "color_roi" if matched_colors else "detector"
-            elif rule_type == "hybrid":
-                is_match = is_match and colors_ok and objects_ok
-                source = "hybrid"
-
-        avg_conf = (sum(confidences) / len(confidences)) if confidences else (0.80 if is_match else 0.0)
+        avg_conf = (
+            sum(confidences) / len(confidences)
+        ) if confidences else (0.80 if is_match else 0.0)
         desc = " | ".join(desc_parts) if desc_parts else "Awaiting expected physical evidence..."
         return is_match, round(avg_conf, 2), desc, source
 

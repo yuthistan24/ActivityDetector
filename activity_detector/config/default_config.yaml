@@ -1,39 +1,28 @@
-# ActivityDetector Configuration (Tabletop Generic Object Monitoring Prototype)
-# All parameters can be overridden here or via CLI flags.
-
-procedure_file: "procedures/default_notebook_handling.yaml"
-target_object: "notebook"
-
+procedure_file: procedures/bottle_tabletop_workflow.yaml
+target_object: bottle
 camera:
-  # Camera index (0, 1, ...) or path to local test video file (e.g. "test_clip.mp4")
   source: 0
   width: 1280
   height: 720
   fps: 30
-
 vision:
-  # Minimum contour area in pixels for optional supporting color contours
   min_contour_area: 700
-
-  # Tabletop Regions of Interest (normalized coordinates 0.0 to 1.0)
   rois:
-    workspace_center:
-      x1: 0.20
-      y1: 0.20
-      x2: 0.70
-      y2: 0.85
-    stowed_area:
-      x1: 0.72
-      y1: 0.20
-      x2: 0.98
-      y2: 0.85
     prep_left:
       x1: 0.02
-      y1: 0.20
-      x2: 0.18
-      y2: 0.85
-
-  # Optional supporting color thresholds (if using colored items/tags)
+      y1: 0.15
+      x2: 0.28
+      y2: 0.92
+    workspace_center:
+      x1: 0.3
+      y1: 0.15
+      x2: 0.68
+      y2: 0.92
+    stowed_area:
+      x1: 0.7
+      y1: 0.15
+      x2: 0.98
+      y2: 0.92
   colors:
     yellow_cover:
       h_min: 18
@@ -49,59 +38,38 @@ vision:
       h_max: 130
       s_max: 255
       v_max: 255
-    red_tag:
-      h_min: 0
-      s_min: 120
-      v_min: 70
-      h_max: 10
-      s_max: 255
-      v_max: 255
-    green_mat:
-      h_min: 38
-      s_min: 80
-      v_min: 50
-      h_max: 85
-      s_max: 255
-      v_max: 255
-
 yolo:
-  # Optional local detector (e.g. YOLOv8 / YOLO11 for person/book/cell phone)
-  enabled: false
-  model_path: ""
-  confidence_threshold: 0.45
-
-vlm:
-  # Local Vision-Language Model via Ollama
   enabled: true
-  provider: "ollama"
-  model: "qwen3.5:latest"
-  alternative_model: "gemma4:e4b-it-qat"
-  host: "http://localhost:11434"
-  sample_interval_seconds: 4.0
-  num_ctx: 2048
-  # Setting num_gpu to 0 offloads compute buffers to CPU to prevent CUDA out-of-memory
-  num_gpu: 0
-  timeout_seconds: 12.0
-
+  model_path: yolo11n.pt
+  confidence_threshold: 0.4
+vlm:
+  enabled: false
+  provider: ollama
+  model: gemma4:latest
+  alternative_model: ''
+  host: http://localhost:11434
+  sample_interval_seconds: 5.0
+  num_ctx: 1024
+  num_gpu: null
+  timeout_seconds: 15.0
+  image_max_dimension: 480
+  jpeg_quality: 75
+  failure_cooldown_seconds: 5.0
+  max_consecutive_failures: 3
 audio:
-  # Local Text-to-Speech announcements
   enabled: true
   rate: 170
   volume: 0.9
   cooldown_seconds: 7.0
   voice_index: 0
-
 recording:
-  # Local session runs and video output
-  output_dir: "runs"
-  video_format: "mp4"
+  output_dir: runs
+  video_format: mp4
   record_fps: 25.0
   auto_record_on_session_start: true
   record_annotated: true
-
 streaming:
-  # Isolated local MJPEG streaming (disabled by default)
   enabled: false
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 8554
-  path: "/video_feed"
+  path: /video_feed

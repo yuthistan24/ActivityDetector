@@ -117,8 +117,8 @@ def test_vlm_pause_and_resume():
     client.stop()
 
 
-def test_pipeline_does_not_sample_vlm_when_idle():
-    """Verify that when engine is in IDLE state, the vision pipeline does NOT submit frames to VLM."""
+def test_pipeline_samples_vlm_in_idle_preview():
+    """Verify that when engine is in IDLE state, the vision pipeline samples VLM in preview mode."""
     from activity_detector.config.settings import get_default_config
     from activity_detector.core.engine import EngineState, EngineUpdate
     from activity_detector.core.procedure import StepDefinition, ExpectedEvidence
@@ -150,11 +150,82 @@ def test_pipeline_does_not_sample_vlm_when_idle():
     )
 
     annotated, evidence = pipeline.process_next_frame(idle_update)
-    # VLM must NOT have received any samples because engine is IDLE
-    assert mock.submit_count == 0
-    assert evidence.vlm_sample_id is None
+    # VLM MUST receive preview sample so operator sees object recognition immediately
+    assert mock.submit_count == 1
 
     pipeline.stop()
+
+
+def test_vlm_target_object_switching():
+    """Verify that changing target object clears previous interpretation and updates prompts."""
+    from activity_detector.config.settings import VlmConfig
+    from activity_detector.vision.vlm import OllamaVlmClient, VlmInterpretation, VlmResponseSchema
+
+    client = OllamaVlmClient(VlmConfig(enabled=False))
+    assert client.target_object == "notebook"
+
+    # Set initial interpretation
+    client._latest_interpretation = VlmInterpretation(
+        schema_data=VlmResponseSchema(
+            object_visible=True,
+            object_description="notebook on desk",
+            open_or_closed="open",
+            held_or_on_surface="on_surface",
+            location="workspace_center",
+            confidence=0.9,
+            is_uncertain=False,
+            reasoning="visible",
+        ),
+        raw_response="",
+        latency_seconds=0.5,
+        target_object="notebook",
+    )
+    assert client.get_latest_interpretation() is not None
+
+    # Change target object
+    client.set_target_object("wrench")
+    assert client.target_object == "wrench"
+    # Previous interpretation must be cleared so stale results don't show
+    assert client.get_latest_interpretation() is None
+
+    # Check prompt generation reflects new target
+    prompt = client._build_prompt("wrench", "Inspect Tool", "Verify wrench is ready", {})
+    assert "wrench" in prompt
+    assert "notebook" not in prompt
+
+    client.stop()
+
+
+def test_vlm_single_in_flight_and_sample_interval():
+    """Verify that at most one inference runs at a time and sample interval limits submission."""
+    import time
+    from activity_detector.config.settings import VlmConfig
+    from activity_detector.vision.vlm import OllamaVlmClient
+
+    config = VlmConfig(enabled=True, sample_interval_seconds=2.0)
+    client = OllamaVlmClient(config)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    # First sample submission succeeds
+    sub1 = client.submit_sample(frame, "notebook", "Step 1", "Inspect")
+    assert sub1 is True
+
+    # Immediate second submission should be dropped due to interval
+    sub2 = client.submit_sample(frame, "notebook", "Step 1", "Inspect")
+    assert sub2 is False
+
+    # Simulate in-flight analysis flag
+    client._last_sample_time = 0.0  # bypass interval
+    client._is_analyzing = True
+    sub3 = client.submit_sample(frame, "notebook", "Step 1", "Inspect")
+    assert sub3 is False  # dropped because already analyzing
+
+    # Test dynamic interval change
+    client.set_sample_interval(5.0)
+    assert client.config.sample_interval_seconds == 5.0
+
+    client.stop()
+
 
 
 

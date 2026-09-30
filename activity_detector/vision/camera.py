@@ -433,7 +433,11 @@ class CameraManager:
             if self._latest_frame is None:
                 fallback = self._create_diagnostic_frame("INITIALIZING CAMERA FEED", f"Source: {self.source}")
                 return False, fallback, 0.0, 0, time.time()
-            return self.is_connected, self._latest_frame.copy(), self._fps, self._frame_id, self.last_successful_read_time
+            try:
+                frame_out = self._latest_frame.copy()
+            except Exception:
+                frame_out = self._latest_frame
+            return self.is_connected, frame_out, self._fps, self._frame_id, self.last_successful_read_time
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Returns comprehensive diagnostic telemetry for UI and audit logs."""

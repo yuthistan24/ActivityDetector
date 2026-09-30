@@ -1,0 +1,91 @@
+# ==============================================================================
+# TABLETOP DEMO PROCEDURE: WATER BOTTLE TRACKING
+# ==============================================================================
+# DISCLAIMER:
+# This is a local engineering prototype for tabletop procedure monitoring.
+# NOT certified for mission-critical or safety-of-life applications.
+#
+# Workflow:
+#   Step 1 – Detect the water bottle in the marked "Prep" area (left).
+#   Step 2 – Track it while it is moved (transitions through workspace).
+#   Step 3 – Confirm it is resting in the marked "Stowed" area (right).
+#
+# Detection: YOLO11n (COCO-pretrained).  Class used: "bottle".
+# ROI hit is determined by YOLO bounding-box centroid inside the region.
+# Stability requirement: 5 consecutive frames + 1.5 s hold.
+# ==============================================================================
+
+id: "bottle_tabletop_workflow_v1"
+title: "Water Bottle Tabletop Workflow"
+version: "1.0.0"
+description: >
+  Detect a water bottle in Prep, track it while it moves, and confirm
+  it is resting in Stowed.  Uses YOLO11n COCO detector for bottle class.
+author: "ActivityDetector Prototype"
+target_object: "bottle"
+
+steps:
+  - id: "step_1_bottle_in_prep"
+    order: 1
+    name: "Bottle in Prep Area"
+    instruction: >
+      Place the water bottle in the left \"Prep\" zone so it is clearly
+      visible to the camera.  Hold it still until the stability bar fills.
+    expected_evidence:
+      target_object: "bottle"
+      required_objects:
+        - "bottle"
+      roi: "prep_left"
+      expected_state: {}
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 5
+      hold_seconds: 1.5
+      min_confidence: 0.45
+      min_vlm_samples: 0
+    timeout_seconds: 60.0
+
+  - id: "step_2_bottle_in_transit"
+    order: 2
+    name: "Bottle in Transit"
+    instruction: >
+      Pick up the bottle and move it toward the right \"Stowed\" zone.
+      The system will track its position.  At least one detection is
+      required outside the Prep area to confirm movement.
+    expected_evidence:
+      target_object: "bottle"
+      required_objects:
+        - "bottle"
+      roi: null
+      expected_state: {}
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 3
+      hold_seconds: 0.5
+      min_confidence: 0.40
+      min_vlm_samples: 0
+    timeout_seconds: 90.0
+    prerequisites:
+      - "step_1_bottle_in_prep"
+
+  - id: "step_3_bottle_in_stowed"
+    order: 3
+    name: "Bottle in Stowed Area"
+    instruction: >
+      Place the bottle in the right \"Stowed\" zone and leave it resting
+      there.  The system requires stable detections before confirming.
+    expected_evidence:
+      target_object: "bottle"
+      required_objects:
+        - "bottle"
+      roi: "stowed_area"
+      expected_state: {}
+    completion_rule:
+      rule_type: "stable_detection"
+      stable_frames: 5
+      hold_seconds: 1.5
+      min_confidence: 0.45
+      min_vlm_samples: 0
+    timeout_seconds: 60.0
+    prerequisites:
+      - "step_2_bottle_in_transit"
