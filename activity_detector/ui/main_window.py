@@ -63,6 +63,7 @@ from activity_detector.ui.widgets import (
 )
 from activity_detector.video.recorder import VideoRecorder
 from activity_detector.video.streamer import MjpegHttpStreamer
+from activity_detector.vision.alias import resolve_target
 from activity_detector.vision.pipeline import STALE_DETECTION_SECONDS, VisionPipeline
 from activity_detector.vision.vlm import BaseVlmClient
 
@@ -368,6 +369,18 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.btn_ack)
 
         lay.addStretch()
+
+        # Mirror toggle — reflects physical camera orientation
+        mirror_on = getattr(self.config.camera, "mirror_preview", True)
+        self.btn_mirror = QPushButton(
+            "🔄 Mirror: ON" if mirror_on else "🔄 Mirror: OFF"
+        )
+        self.btn_mirror.setToolTip(
+            "Toggle horizontal mirror for laptop webcam. "
+            "Mirroring ensures left/right on screen matches physical left/right."
+        )
+        self.btn_mirror.clicked.connect(self._toggle_mirror)
+        lay.addWidget(self.btn_mirror)
 
         self.btn_record = QPushButton("Record Video")
         self.btn_record.clicked.connect(self._toggle_recording)
@@ -883,11 +896,38 @@ class MainWindow(QMainWindow):
         if ok:
             self.target_object = new_name
             self.engine.set_target_object(new_name)
-            self.lbl_target_validation.setText("")
-            self._append_log(f"Target changed to '{new_name}'.")
+
+            # Build display message showing alias info
+            res = self.pipeline.alias_resolution
+            display_parts = [f"Target → '{new_name}'"]
+            if res.alias_used:
+                display_parts.append(f"(detector class: '{res.canonical}')")
+            if res.backend == "open_vocab":
+                if self.pipeline.open_vocab.available:
+                    display_parts.append("[open-vocab]")
+                else:
+                    display_parts.append(
+                        "[open-vocab — weights absent; see Help for setup]"
+                    )
+            elif res.note:
+                display_parts.append(f"ℹ {res.note}")
+
+            self.lbl_target_validation.setStyleSheet("color: #34d399; font-size: 10px;")
+            self.lbl_target_validation.setText(" ".join(display_parts))
+            self._append_log(" ".join(display_parts))
+
             if self.session_manager.is_active:
+                # FIX: log_event takes step_id as a keyword str, not a positional dict
                 self.session_manager.log_event(
-                    "TARGET_CHANGED", {"target_object": new_name}
+                    event_type="TARGET_CHANGED",
+                    step_id=None,
+                    message=f"Detection target changed to '{new_name}' (canonical: '{res.canonical}')",
+                    metadata={
+                        "user_label": new_name,
+                        "canonical": res.canonical,
+                        "backend": res.backend,
+                        "alias_used": res.alias_used,
+                    },
                 )
             # Persist to config
             self.config.target_object = new_name
@@ -896,11 +936,10 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 logger.warning(f"Could not persist config: {exc}")
         else:
-            self.lbl_target_validation.setText(
-                f"⚠ Unsupported: '{new_name}' is not in YOLO11n vocabulary. "
-                "Detection target unchanged."
-            )
-            self._append_log(f"REJECTED target '{new_name}': not in YOLO vocabulary.")
+            self.lbl_target_validation.setStyleSheet("color: #f87171; font-size: 10px;")
+            # msg is already a concise explanation from resolve_target (no 80-class dump)
+            self.lbl_target_validation.setText(f"⚠ {msg}")
+            self._append_log(f"REJECTED target '{new_name}': {msg}")
 
     # ------------------------------------------------------------------
     # Session control
@@ -1033,6 +1072,23 @@ class MainWindow(QMainWindow):
         muted = self.speech.toggle_mute()
         self.btn_mute.setText("Unmute Audio" if muted else "Mute Audio")
         self._append_log(f"Audio {'muted' if muted else 'unmuted'}.")
+
+    def _toggle_mirror(self) -> None:
+        """Toggle horizontal mirror for camera preview and detection boxes."""
+        new_val = not self.pipeline.mirror
+        self.pipeline.mirror = new_val
+        label = "🔄 Mirror: ON" if new_val else "🔄 Mirror: OFF"
+        self.btn_mirror.setText(label)
+        self._append_log(
+            f"Preview mirror {'enabled' if new_val else 'disabled'}. "
+            "Detection coordinates updated to match."
+        )
+        # Persist
+        self.config.camera.mirror_preview = new_val
+        try:
+            save_config(self.config, CONFIG_PATH)
+        except Exception as exc:
+            logger.warning(f"Could not persist mirror config: {exc}")
 
     def _load_custom_procedure(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

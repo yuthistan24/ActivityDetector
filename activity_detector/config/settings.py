@@ -18,6 +18,10 @@ class CameraConfig(BaseModel):
     width: int = Field(default=1280, ge=320, le=3840)
     height: int = Field(default=720, ge=240, le=2160)
     fps: int = Field(default=30, ge=1, le=120)
+    mirror_preview: bool = Field(
+        default=True,
+        description="Horizontally flip the preview and detection boxes (laptop webcam default)."
+    )
 
 
 class ColorRule(BaseModel):
@@ -129,7 +133,7 @@ def get_default_config() -> AppConfig:
     return AppConfig(
         procedure_file="procedures/bottle_tabletop_workflow.yaml",
         target_object="bottle",
-        camera=CameraConfig(source=0, width=1280, height=720, fps=30),
+        camera=CameraConfig(source=0, width=1280, height=720, fps=30, mirror_preview=True),
         vision=VisionConfig(
             min_contour_area=700,
             rois={

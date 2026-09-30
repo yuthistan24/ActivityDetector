@@ -1,10 +1,11 @@
 procedure_file: procedures/bottle_tabletop_workflow.yaml
-target_object: bottle
+target_object: cell phone
 camera:
   source: 0
   width: 1280
   height: 720
   fps: 30
+  mirror_preview: true
 vision:
   min_contour_area: 700
   rois:

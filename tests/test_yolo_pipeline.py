@@ -422,7 +422,8 @@ class TestDetectorUnavailable:
         assert det.supported_classes == []
 
     def test_pipeline_target_validation_when_unavailable(self, rois):
-        """When YOLO is disabled, set_target_object should still succeed gracefully."""
+        """When YOLO is disabled, set_target_object should succeed for known COCO
+        classes (resolved via alias map) and reject genuinely unknown names gracefully."""
         from activity_detector.vision.pipeline import VisionPipeline
         from activity_detector.config.settings import VisionConfig, VlmConfig, AppConfig
 
@@ -436,8 +437,15 @@ class TestDetectorUnavailable:
         )
         pipeline = VisionPipeline(cfg, vlm_client=None)
         assert not pipeline.yolo.available
-        ok, msg = pipeline.set_target_object("anything_at_all")
-        assert ok  # graceful — no crash
+
+        # A known COCO class must succeed (alias resolution works even without YOLO)
+        ok, msg = pipeline.set_target_object("bottle")
+        assert ok, f"Known COCO class 'bottle' should be accepted: {msg}"
+
+        # A truly unknown name must be rejected gracefully — no crash, no exception
+        ok2, msg2 = pipeline.set_target_object("anything_at_all_12345")
+        assert not ok2, "Genuinely unknown class should be rejected"
+        assert len(msg2) < 400, "Rejection message must be concise"
 
 
 

@@ -30,6 +30,7 @@ from activity_detector.core.engine import (
     EngineUpdate,
     FrameEvidence,
 )
+from activity_detector.vision.alias import OpenVocabDetector, TargetResolution, resolve_target
 from activity_detector.vision.camera import CameraManager
 from activity_detector.vision.detector import DeterministicDetector
 from activity_detector.vision.vlm import BaseVlmClient, OllamaVlmClient, VlmInterpretation
@@ -67,19 +68,16 @@ class VisionPipeline:
     ) -> None:
         self.config = config
         self._target_object: str = getattr(config, "target_object", "bottle")
+        self._mirror: bool = getattr(config.camera, "mirror_preview", True)
 
         self.camera = CameraManager(config.camera)
         self.detector = DeterministicDetector(config.vision)  # colour/ROI cues
         self.yolo = YoloDetector(config.yolo, config.vision.rois)
+        self.open_vocab = OpenVocabDetector()  # optional; available=False until weights present
 
-        # Wire target class into YOLO immediately
-        if self.yolo.available:
-            ok = self.yolo.set_target_class(self._target_object)
-            if not ok:
-                logger.warning(
-                    f"Initial target '{self._target_object}' not in YOLO vocab; "
-                    "detecting all classes until a valid target is set."
-                )
+        # Resolve initial target through alias map
+        self._resolution: TargetResolution = resolve_target(self._target_object)
+        self._apply_resolution(self._resolution)
 
         # VLM (optional)
         if vlm_client is not None:
@@ -103,6 +101,24 @@ class VisionPipeline:
         # Target-class validation state for UI reporting
         self._target_supported: bool = True
         self._target_validation_msg: str = ""
+        # Rate-limit unsupported-target warnings (avoid per-frame spam)
+        self._last_unsupported_warn_time: float = 0.0
+
+    def _apply_resolution(self, res: TargetResolution) -> None:
+        """Push resolved canonical name into the appropriate detector."""
+        if res.backend == "yolo" and self.yolo.available:
+            ok = self.yolo.set_target_class(res.canonical)
+            if not ok:
+                logger.warning(
+                    f"Alias resolved to '{res.canonical}' but YOLO rejected it. "
+                    "Detecting all classes until fixed."
+                )
+        elif res.backend == "open_vocab":
+            # open_vocab detector will be queried with res.query per-frame
+            # Nothing to pre-set; query is embedded in res
+            pass
+        elif res.backend == "unsupported":
+            logger.warning(f"Target '{res.user_label}' is unsupported: {res.note}")
 
     # ------------------------------------------------------------------
     # Properties
@@ -119,22 +135,56 @@ class VisionPipeline:
     @property
     def yolo_status(self) -> str:
         """Human-readable detector status for the UI."""
+        res = self._resolution
+        mirror_tag = "mirror" if self._mirror else "no-mirror"
+
+        if res and res.backend == "open_vocab":
+            if self.open_vocab.available:
+                return (
+                    f"Open-Vocab ({self.open_vocab._backend}) | "
+                    f"query: '{res.query}' | {mirror_tag}"
+                )
+            else:
+                return (
+                    f"Open-Vocab: UNAVAILABLE — weights absent | "
+                    f"target '{res.user_label}' requires setup | {mirror_tag}"
+                )
+
         if not self.yolo.available:
-            return f"UNAVAILABLE — {self.yolo.status_message}"
+            return f"YOLO11n UNAVAILABLE — {self.yolo.status_message} | {mirror_tag}"
+
         cls = self.yolo.target_class or "(all classes)"
+        alias_tag = ""
+        if res and res.alias_used:
+            alias_tag = f" [{res.user_label}→{cls}]"
         lat = self.yolo.inference_latency_ms
         return (
-            f"YOLO11n | target: {cls} | "
+            f"YOLO11n | target: {cls}{alias_tag} | "
             f"conf≥{self.config.yolo.confidence_threshold:.2f} | "
-            f"latency: {lat:.0f} ms"
+            f"latency: {lat:.0f} ms | {mirror_tag}"
         )
 
     @property
     def supported_classes(self) -> List[str]:
         return self.yolo.supported_classes
 
+    @property
+    def mirror(self) -> bool:
+        return self._mirror
+
+    @mirror.setter
+    def mirror(self, value: bool) -> None:
+        self._mirror = value
+        self.config.camera.mirror_preview = value
+
+    @property
+    def alias_resolution(self) -> TargetResolution:
+        """Current target alias resolution result (for UI display)."""
+        return self._resolution
+
     def is_target_supported(self, name: str) -> bool:
-        return self.yolo.is_class_supported(name)
+        res = resolve_target(name)
+        return res.backend != "unsupported"
 
     # ------------------------------------------------------------------
     # Control
@@ -144,32 +194,32 @@ class VisionPipeline:
         """
         Change the detection target.  Returns (success, message).
 
-        If the name is not in the YOLO vocabulary the filter is NOT changed
-        and an error message is returned so the UI can display it.
+        Uses alias resolution so "phone" → "cell phone",
+        "earbuds" → open_vocab backend, etc.
+        Unsupported names are rejected with a concise message (no full 80-class dump).
         """
         name = object_name.strip()
         if not name:
             return False, "Target name must not be empty."
 
-        if self.yolo.available:
-            ok = self.yolo.set_target_class(name)
-            if not ok:
-                supported = ", ".join(self.yolo.supported_classes[:20])
-                msg = (
-                    f"'{name}' is not in the YOLO11n vocabulary "
-                    f"({len(self.yolo.supported_classes)} COCO classes). "
-                    f"Supported examples: {supported} …"
-                )
-                self._target_supported = False
-                self._target_validation_msg = msg
-                logger.warning(msg)
-                return False, msg
-        else:
-            logger.warning(
-                "YOLO not available; target label stored but cannot be validated."
-            )
+        res = resolve_target(name)
 
-        self._target_object = name
+        if res.backend == "unsupported":
+            now = time.time()
+            # Rate-limit identical warnings to once per 5 s
+            if (now - self._last_unsupported_warn_time) > 5.0:
+                logger.warning(f"Unsupported target '{name}': {res.note}")
+                self._last_unsupported_warn_time = now
+            self._target_supported = False
+            self._target_validation_msg = res.note
+            return False, res.note
+
+        # Apply to relevant detector
+        self._apply_resolution(res)
+
+        # Store user-visible label and canonical backend label
+        self._target_object = name          # what the user typed (for display)
+        self._resolution = res
         self._target_supported = True
         self._target_validation_msg = ""
         self._last_vlm_interpretation = None
@@ -177,10 +227,17 @@ class VisionPipeline:
         self._last_yolo_had_target = False
 
         if self.vlm:
-            self.vlm.set_target_object(name)
+            self.vlm.set_target_object(res.canonical or name)
 
-        logger.info(f"Pipeline target set to '{name}'")
-        return True, f"Target changed to '{name}'."
+        info_msg = f"Target set to '{name}'"
+        if res.alias_used:
+            info_msg += f" (canonical: '{res.canonical}')"
+        if res.backend == "open_vocab":
+            info_msg += " [open-vocab backend]"
+            if not self.open_vocab.available:
+                info_msg += " — weights absent, see setup instructions"
+        logger.info(info_msg)
+        return True, info_msg
 
     def start(self) -> bool:
         return self.camera.start()
@@ -208,6 +265,13 @@ class VisionPipeline:
         if raw_frame is None:
             raw_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 
+        # ── Mirror / orientation ──────────────────────────────────────
+        # Apply BEFORE detectors so bboxes, ROIs, and display are all
+        # in the same coordinate space. When mirror=True the user sees
+        # left/right as physically expected for a laptop webcam.
+        if self._mirror:
+            raw_frame = cv2.flip(raw_frame, 1)   # horizontal flip
+
         # Track UI fresh-frame rate
         if frame_id > 0 and frame_id != self._last_seen_frame_id:
             self._last_seen_frame_id = frame_id
@@ -231,22 +295,33 @@ class VisionPipeline:
 
         # ── 1. YOLO detection (PRIMARY) ──────────────────────────────
         yolo_detections: List[DetectionItem] = []
-        if self.yolo.available:
+        canonical = self._resolution.canonical if self._resolution else self._target_object
+        if self.yolo.available and self._resolution.backend == "yolo":
             yolo_detections = self.yolo.detect(raw_frame)
-            # Update stale-detection tracking
             target_hits = [
                 d for d in yolo_detections
-                if d.name.lower() == self._target_object.lower()
+                if d.name.lower() == canonical.lower()
             ]
             if target_hits:
                 self._last_yolo_detection_time = now
                 self._last_yolo_had_target = True
-            # Even if empty, mark inference ran (time already set inside yolo)
+
+        # ── 1b. Open-vocabulary detection (non-COCO targets) ─────────
+        open_vocab_detections: List[DetectionItem] = []
+        if self._resolution.backend == "open_vocab" and self.open_vocab.available:
+            open_vocab_detections = self.open_vocab.detect(
+                raw_frame,
+                text_query=self._resolution.query,
+                confidence_threshold=self.config.yolo.confidence_threshold,
+            )
+            if open_vocab_detections:
+                self._last_yolo_detection_time = now
+                self._last_yolo_had_target = True
 
         # ── 2. HSV colour cues (SUPPORTING ONLY) ─────────────────────
         colour_detections: List[DetectionItem] = self.detector.detect(raw_frame)
 
-        all_detections = yolo_detections + colour_detections
+        all_detections = yolo_detections + open_vocab_detections + colour_detections
 
         # ── 3. Stale-result flag ──────────────────────────────────────
         yolo_result_is_stale = (
